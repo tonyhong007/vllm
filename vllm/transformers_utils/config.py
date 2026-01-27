@@ -10,12 +10,9 @@ from pathlib import Path
 from typing import Any, Literal, TypeAlias
 
 import huggingface_hub
-from huggingface_hub import (
-    get_safetensors_metadata,
-)
+from huggingface_hub import get_safetensors_metadata
 from packaging.version import Version
 from transformers import GenerationConfig, PretrainedConfig
-from transformers.configuration_utils import ALLOWED_LAYER_TYPES
 from transformers.models.auto.image_processing_auto import get_image_processor_config
 from transformers.models.auto.modeling_auto import (
     MODEL_FOR_CAUSAL_LM_MAPPING_NAMES,
@@ -23,18 +20,12 @@ from transformers.models.auto.modeling_auto import (
 )
 from transformers.models.auto.tokenization_auto import get_tokenizer_config
 from transformers.utils import CONFIG_NAME as HF_CONFIG_NAME
-
 from vllm import envs
 from vllm.logger import init_logger
 from vllm.transformers_utils.utils import parse_safetensors_file_metadata
 
 from .config_parser_base import ConfigParserBase
-from .gguf_utils import (
-    check_gguf_file,
-    is_gguf,
-    is_remote_gguf,
-    split_remote_gguf,
-)
+from .gguf_utils import check_gguf_file, is_gguf, is_remote_gguf, split_remote_gguf
 from .repo_utils import (
     _get_hf_token,
     file_or_path_exists,
@@ -43,6 +34,15 @@ from .repo_utils import (
     try_get_local_file,
     with_retry,
 )
+
+try:
+    # Transformers v5
+    from transformers.configuration_utils import ALLOWED_ATTENTION_LAYER_TYPES
+except ImportError:
+    # Transformers v4
+    from transformers.configuration_utils import (
+        ALLOWED_LAYER_TYPES as ALLOWED_ATTENTION_LAYER_TYPES,
+    )
 
 if envs.VLLM_USE_MODELSCOPE:
     from modelscope import AutoConfig
@@ -102,6 +102,14 @@ _AUTO_CONFIG_KWARGS_OVERRIDES: dict[str, dict[str, Any]] = {
     "Llama_Nemotron_Nano_VL": {"attn_implementation": "eager"},
     "NVLM_D": {"has_no_defaults_at_init": True},
 }
+
+
+def is_rope_parameters_nested(rope_parameters: dict[str, Any]) -> bool:
+    """Check if rope_parameters is nested by layer types."""
+    # Cannot be nested if rope_parameters is empty
+    if not rope_parameters:
+        return False
+    return set(rope_parameters.keys()).issubset(ALLOWED_ATTENTION_LAYER_TYPES)
 
 
 class HFConfigParser(ConfigParserBase):
@@ -346,7 +354,7 @@ def patch_rope_parameters(config: PretrainedConfig) -> None:
         config.rope_parameters["original_max_position_embeddings"] = ompe
 
     # Handle nested rope_parameters in interleaved sliding attention models
-    if set(config.rope_parameters.keys()).issubset(ALLOWED_LAYER_TYPES):
+    if is_rope_parameters_nested(config.rope_parameters):
         for rope_parameters_layer_type in config.rope_parameters.values():
             patch_rope_parameters_dict(rope_parameters_layer_type)
     else:
@@ -913,7 +921,6 @@ def maybe_register_config_serialize_by_value() -> None:
         import pickle
 
         import cloudpickle
-
         from vllm.config import VllmConfig
 
         # Register multiprocessing reducers to handle cross-process

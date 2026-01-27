@@ -157,6 +157,7 @@ class RotaryEmbedding(RotaryEmbeddingBase):
         key: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """A PyTorch-native implementation of forward()."""
+        self._match_cos_sin_cache_dtype(query)
         return self.forward_static(
             positions,
             query,
