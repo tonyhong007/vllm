@@ -211,20 +211,69 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-        )
+        # Import timing manager lazily to avoid circular imports
+        from vllm.utils.layer_timing import LayerTimingManager
+        timing_manager = LayerTimingManager.get_instance()
+        
+        if timing_manager.is_enabled:
+            # Total layer timing
+            total_start = torch.cuda.Event(enable_timing=True)
+            total_end = torch.cuda.Event(enable_timing=True)
+            total_start.record()
+            
+            # Self Attention (includes input layernorm)
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            
+            attn_start = torch.cuda.Event(enable_timing=True)
+            attn_end = torch.cuda.Event(enable_timing=True)
+            attn_start.record()
+            
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+            
+            attn_end.record()
 
-        # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+            # Fully Connected (includes post-attn layernorm)
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+            
+            ffn_start = torch.cuda.Event(enable_timing=True)
+            ffn_end = torch.cuda.Event(enable_timing=True)
+            ffn_start.record()
+            
+            hidden_states = self.mlp(hidden_states)
+            
+            ffn_end.record()
+            total_end.record()
+            
+            # Synchronize and record timings
+            torch.cuda.synchronize()
+            
+            timing_manager.record_timing(
+                layer_idx=0,
+                attention_ms=attn_start.elapsed_time(attn_end),
+                ffn_ms=ffn_start.elapsed_time(ffn_end),
+                total_layer_ms=total_start.elapsed_time(total_end),
+            )
+        else:
+            # Original code path without timing
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+            hidden_states = self.mlp(hidden_states)
+        
         return hidden_states, residual
 
 
