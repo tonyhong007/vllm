@@ -47,6 +47,11 @@ class NewRequestData:
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
 
+    # Sage concurrent prefill: True if blocks were transferred from chunks
+    sage_blocks_transferred: bool = False
+    # Chunk boundary positions for GPU-direct blending (e.g., [0, 2770, 4615, ...])
+    sage_chunk_boundaries: list[int] | None = None
+
     @classmethod
     def from_request(
         cls,
@@ -65,6 +70,8 @@ class NewRequestData:
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
             prefill_token_ids=prefill_token_ids,
+            sage_blocks_transferred=getattr(request, "sage_blocks_transferred", False),
+            sage_chunk_boundaries=getattr(request, "sage_chunk_boundaries", None),
         )
 
     def __repr__(self) -> str:

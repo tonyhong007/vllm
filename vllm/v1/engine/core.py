@@ -9,11 +9,13 @@ from collections import deque
 from collections.abc import Callable, Generator
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
+from copy import deepcopy
 from inspect import isclass, signature
 from logging import DEBUG
-from typing import Any, TypeVar, cast
+from typing import Any, Optional, TypeVar, cast
 
 import msgspec
+import torch
 import zmq
 
 from vllm.config import ParallelConfig, VllmConfig
@@ -206,6 +208,23 @@ class EngineCore:
 
         self.aborts_queue = queue.Queue[list[str]]()
 
+        # Concurrent prefill configuration
+        self.enable_sage = os.environ.get(
+            "ENABLE_SAGE", "False"
+        ).lower() == "true"
+        self.blend_special_str = os.environ.get("LMCACHE_BLEND_SPECIAL_STR", "[SEP]")
+        
+        self.sage_skip_rope_adjustment = os.environ.get(
+            "SAGE_SKIP_ROPE_ADJUSTMENT", "False"
+        ).lower() == "true"
+
+        # Concurrent prefill state tracking
+        self.chunk_groups: dict[str, list[str]] = {}  # parent_req_id -> [chunk_req_ids]
+        self.chunk_completion: dict[str, set[str]] = {}  # parent_req_id -> completed chunks
+        self.parent_requests: dict[str, Request] = {}  # parent_req_id -> original Request
+        self.chunk_to_parent: dict[str, str] = {}  # chunk_req_id -> parent_req_id
+        self._separator_token_ids: Optional[list[int]] = None
+
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
         freeze_gc_heap()
@@ -214,6 +233,10 @@ class EngineCore:
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
         enable_envs_cache()
+
+        # Pre-load separator token IDs if Sage is enabled to avoid delay during request processing
+        if self.enable_sage:
+            _ = self._get_separator_token_ids()
 
     def _initialize_kv_caches(
         self, vllm_config: VllmConfig
@@ -272,6 +295,9 @@ class EngineCore:
         `request_wave`: indicate which wave of requests this is expected to
         belong to in DP case
         """
+        current_time = time.time()
+        logger.info("Adding request %s at time %.2f", request.request_id, current_time)
+
         # Validate the request_id type.
         if not isinstance(request.request_id, str):
             raise TypeError(
@@ -296,6 +322,17 @@ class EngineCore:
                 "Got kv_transfer_params, but no KVConnector found. "
                 "Disabling KVTransfer for this request."
             )
+
+        if self.enable_sage and not getattr(request, 'is_chunk_request', False):
+            chunk_requests = self._split_request_into_chunks(request)
+            if chunk_requests:
+                for chunk_req in chunk_requests:
+                    self.scheduler.add_request(chunk_req)
+                logger.info(
+                    "Added %d chunk requests for concurrent prefill of %s",
+                    len(chunk_requests), request.request_id
+                )
+                return
 
         self.scheduler.add_request(request)
 
@@ -359,7 +396,64 @@ class EngineCore:
             scheduler_output, model_output
         )
 
+        # Handle concurrent prefill chunk completions (now KV info is already captured)
+        if self.enable_sage:
+            self._process_chunk_completions(scheduler_output)
+
+            # Filter out outputs from Sage chunk requests to prevent them from being returned to users.
+            # Only the final request output should be returned.
+            for client_idx, outputs in engine_core_outputs.items():
+                filtered_outputs = []
+                for output in outputs.outputs:
+                    req_id = output.request_id
+                    # Check if this is a chunk request by checking if it's in the chunk tracking dicts
+                    # This handles both _chunk_ patterns
+                    is_chunk_request = (
+                        req_id in self.chunk_to_parent
+                        or any(
+                            req_id.startswith(f"{parent_req_id}_chunk_")
+                            for parent_req_id in self.chunk_groups.keys()
+                        )
+                    )
+                    if is_chunk_request:
+                        logger.info(
+                            f"Filtering out output from Sage chunk request {req_id}"
+                        )
+                    else:
+                        filtered_outputs.append(output)
+                # Update the outputs list with filtered results
+                outputs.outputs = filtered_outputs
+
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+
+    def _process_chunk_completions(self, scheduler_output) -> None:
+        """Process completed chunk requests and trigger blending when ready."""
+        # Get completed request IDs from scheduler output
+        finished_req_ids = set(scheduler_output.finished_req_ids)
+
+        # Filter for chunk request completions
+        chunk_completions = {
+            req_id for req_id in finished_req_ids
+            if req_id in self.chunk_to_parent
+        }
+
+        if not chunk_completions:
+            return
+
+        # Check which parents are ready for blending
+        parents_ready = self._handle_chunk_completion(chunk_completions)
+
+        # Trigger blending for ready parents
+        for parent_id in parents_ready:
+            try:
+                self._launch_final_request(parent_id)
+            except Exception as e:
+                logger.error(
+                    "Failed to blend and launch final request for %s: %s",
+                    parent_id, e
+                )
+                # Clean up state on failure
+                self._cleanup_chunk_state(parent_id)
 
     def post_step(self, model_executed: bool) -> None:
         # When using async scheduling we can't get draft token ids in advance,
@@ -555,6 +649,259 @@ class EngineCore:
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
         return self.model_executor.collective_rpc(method, timeout, args, kwargs)
+
+    # ==================== Concurrent Prefill Methods ====================
+
+    def _get_separator_token_ids(self) -> list[int]:
+        """Get the separator token IDs, loading tokenizer if needed."""
+        if self._separator_token_ids is None:
+            from vllm.transformers_utils.tokenizer import get_tokenizer
+            tokenizer = get_tokenizer(
+                self.vllm_config.model_config.tokenizer,
+                tokenizer_mode=str(self.vllm_config.model_config.tokenizer_mode),
+                trust_remote_code=self.vllm_config.model_config.trust_remote_code,
+                revision=self.vllm_config.model_config.tokenizer_revision,
+            )
+            self._separator_token_ids = tokenizer.encode(
+                self.blend_special_str, add_special_tokens=False
+            )
+            logger.info(
+                "Separator '%s' tokenized to: %s",
+                self.blend_special_str, self._separator_token_ids
+            )
+        return self._separator_token_ids
+
+    def _find_separator_positions(
+        self, prompt_tokens: list[int], sep_tokens: list[int]
+    ) -> list[tuple[int, int]]:
+        """Find positions of separator tokens and return chunk boundaries.
+
+        Returns list of (start, end) tuples representing each chunk's token range.
+        """
+        if not sep_tokens:
+            return [(0, len(prompt_tokens))]
+
+        sep_len = len(sep_tokens)
+        positions = []
+
+        # Find all separator positions
+        sep_positions = []
+        for i in range(len(prompt_tokens) - sep_len + 1):
+            if prompt_tokens[i:i + sep_len] == sep_tokens:
+                sep_positions.append(i)
+
+        # Build chunk boundaries
+        start = 0
+        for sep_pos in sep_positions:
+            if sep_pos > start:
+                # Chunk from start to separator (inclusive of separator)
+                positions.append((start, sep_pos + sep_len))
+            start = sep_pos + sep_len
+
+        # Add final chunk (from last separator to end)
+        if start < len(prompt_tokens):
+            positions.append((start, len(prompt_tokens)))
+
+        return positions
+
+    def _create_chunk_request(
+        self, parent_request: Request, chunk_id: str, chunk_tokens: list[int],
+        position_offset: int = 0
+    ) -> Request:
+        """Create a chunk request from the parent request.
+
+        Args:
+            parent_request: The original request being split
+            chunk_id: Unique ID for this chunk
+            chunk_tokens: Token IDs for this chunk
+            position_offset: Starting position in the full sequence (for correct rotary embeddings)
+        """
+
+        chunk_params = deepcopy(parent_request.sampling_params)
+        chunk_params.max_tokens = 1
+
+        # Create a new Request with the chunk's tokens
+        chunk_request = Request(
+            request_id=chunk_id,
+            prompt_token_ids=chunk_tokens,
+            sampling_params=chunk_params,
+            pooling_params=parent_request.pooling_params,
+            eos_token_id=parent_request.eos_token_id,
+            client_index=parent_request.client_index,
+            arrival_time=parent_request.arrival_time,
+            lora_request=parent_request.lora_request,
+            cache_salt=parent_request.cache_salt,
+            priority=parent_request.priority,
+            block_hasher=self.request_block_hasher,
+        )
+        # Mark as chunk request and set position offset for correct rotary embeddings
+        chunk_request.is_chunk_request = True
+        chunk_request.sage_position_offset = position_offset
+        return chunk_request
+
+    def _split_request_into_chunks(self, request: Request) -> list[Request]:
+        """Split request at separator tokens into chunk requests for concurrent prefill."""
+        sep_tokens = self._get_separator_token_ids()
+
+        # Find separator positions in prompt_token_ids
+        prompt_tokens = list(request.prompt_token_ids) if request.prompt_token_ids else []
+        split_positions = self._find_separator_positions(prompt_tokens, sep_tokens)
+
+        if len(split_positions) <= 1:
+            # No split needed, return original request
+            return []
+
+        # Create chunk requests
+        chunk_requests = []
+        for i, (start, end) in enumerate(split_positions):
+            current_time = time.time()
+            chunk_id = f"{request.request_id}_chunk_{i}"
+            chunk_tokens = prompt_tokens[start:end]
+            chunk_req = self._create_chunk_request(request, chunk_id, chunk_tokens, start)
+            chunk_requests.append(chunk_req)
+            logger.info(
+                "Created chunk %s with %d tokens (positions %d-%d), position_offset=%d at time %.2f",
+                chunk_id, len(chunk_tokens), start, end, start, current_time
+            )
+
+        # Track parent-child relationships
+        self.chunk_groups[request.request_id] = [c.request_id for c in chunk_requests]
+        self.chunk_completion[request.request_id] = set()
+        self.parent_requests[request.request_id] = request
+        for c in chunk_requests:
+            self.chunk_to_parent[c.request_id] = request.request_id
+            # Register chunk with scheduler so it preserves blocks when chunk finishes
+            self.scheduler.register_sage_chunk(c.request_id, request.request_id)
+
+        logger.info(
+            "Split request %s into %d chunks",
+            request.request_id, len(chunk_requests)
+        )
+
+        # Store chunk boundaries on parent request for GPU-direct blending
+        # Boundaries are the starting positions of each chunk
+        request.sage_chunk_boundaries = [start for start, end in split_positions]
+        logger.info(
+            f"[SAGE_BLEND] Stored chunk_boundaries on parent: {request.sage_chunk_boundaries}"
+        )
+
+        return chunk_requests
+
+    def _handle_chunk_completion(self, completed_req_ids: set[str]) -> list[str]:
+        """Check for completed chunks and trigger blending when all chunks done.
+
+        Note: KV cache info is already captured by _capture_chunk_kv_info_before_free()
+        which runs BEFORE update_from_output(). This method just tracks completion
+        and triggers blending when all chunks are done.
+        """
+        parents_ready_for_blending = []
+
+        for req_id in completed_req_ids:
+            if req_id in self.chunk_to_parent:
+                parent_id = self.chunk_to_parent[req_id]
+
+                start_time = time.time()
+                logger.info(
+                    "Finished chunk %s for parent %s, at time %.2f",
+                    req_id, parent_id, start_time
+                )
+
+                # Mark chunk as complete
+                self.chunk_completion[parent_id].add(req_id)
+
+                # Check if all chunks are done
+                if self.chunk_completion[parent_id] == set(self.chunk_groups[parent_id]):
+                    parents_ready_for_blending.append(parent_id)
+                    logger.info(
+                        "All %d chunks complete for parent %s, ready for blending",
+                        len(self.chunk_groups[parent_id]), parent_id
+                    )
+
+        return parents_ready_for_blending
+
+    def _launch_final_request(self, parent_id: str) -> None:
+        """Launch final request for generation after chunk prefilling.
+
+        ZERO-COPY approach (optimized):
+        1. Transfer chunk blocks directly to parent (no GPU copy needed!)
+        2. Set num_computed_tokens so scheduler knows most tokens are done
+        3. Parent uses transferred blocks directly for decode
+        4. No data movement - blocks already have KV with correct positions
+           (sage_position_offset ensures correct RoPE during chunk prefill)
+        """
+        parent_request = self.parent_requests[parent_id]
+        prompt_len = len(parent_request.prompt_token_ids)
+        
+        transfer_result = None
+        if self.sage_skip_rope_adjustment:
+            # ZERO-COPY: Transfer chunk blocks directly to parent
+            transfer_result = self.scheduler.transfer_sage_blocks_to_parent_zero_copy(parent_id)
+            
+        if transfer_result:
+            total_tokens, total_blocks, _ = transfer_result
+
+            # Set num_computed_tokens so scheduler knows these tokens are done
+            # Leave at least 1 token for the scheduler to process
+            parent_request.num_computed_tokens = min(total_tokens, prompt_len - 1)
+
+            logger.info(
+                f"[SAGE_ZERO_COPY] Parent {parent_id}: prompt_len={prompt_len}, "
+                f"transferred {total_tokens} tokens, {total_blocks} blocks, "
+                f"num_computed_tokens={parent_request.num_computed_tokens}"
+            )
+
+            # Mark that this request has pre-assigned blocks (for LMCache to skip loading)
+            parent_request.sage_blocks_transferred = True
+            logger.info(
+                f"[SAGE_ZERO_COPY] Set sage_blocks_transferred=True for {parent_id}"
+            )
+        else:
+            logger.info(
+                f"Parent request {parent_id}: prompt_len={prompt_len}, "
+                f"no chunk blocks (will prefill normally)"
+            )
+            parent_request.sage_blocks_transferred = False
+
+        # Add parent request to scheduler
+        # Since blocks are already in req_to_blocks, allocate_slots will only
+        # allocate blocks for the remaining (1 or few) tokens
+        logger.info(
+            f"[SAGE_ZERO_COPY] Adding parent {parent_id} to scheduler, "
+            f"sage_blocks_transferred={parent_request.sage_blocks_transferred}"
+        )
+        self.scheduler.add_request(parent_request)
+
+        # Clean up parent tracking
+        self._partial_cleanup_chunk_state(parent_id)
+
+        logger.info(
+            "Final request %s launched for generation. Prompt len: %d",
+            parent_id, prompt_len
+        )
+        logger.info(f"Final request {parent_id} first 100 token ids: {parent_request.prompt_token_ids[:100]}")
+
+    def _partial_cleanup_chunk_state(self, parent_id: str) -> None:
+        """Partial cleanup - preserves chunk blocks for blending."""
+        # Clean up parent tracking but NOT the chunk_to_parent mapping
+        # as we need that to track which chunks belong to which parent
+        self.chunk_groups.pop(parent_id, None)
+        self.chunk_completion.pop(parent_id, None)
+        self.parent_requests.pop(parent_id, None)
+
+    def _cleanup_chunk_state(self, parent_id: str) -> None:
+        """Clean up state tracking for completed concurrent prefill."""
+        chunk_ids = self.chunk_groups.get(parent_id, [])
+
+        # Clean up chunk tracking
+        for chunk_id in chunk_ids:
+            self.chunk_to_parent.pop(chunk_id, None)
+
+        # Clean up parent tracking
+        self.chunk_groups.pop(parent_id, None)
+        self.chunk_completion.pop(parent_id, None)
+        self.parent_requests.pop(parent_id, None)
+
+    # ==================== End Concurrent Prefill Methods ====================
 
     def preprocess_add_request(self, request: EngineCoreRequest) -> tuple[Request, int]:
         """Preprocess the request.

@@ -1325,12 +1325,33 @@ class GPUModelRunner(
         cu_num_tokens, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
 
         # Get positions.
+        # For Sage concurrent prefill, add sage_position_offset so chunks have correct RoPE
         positions_np = self.positions.np[:total_num_scheduled_tokens]
         np.add(
             self.input_batch.num_computed_tokens_cpu[req_indices],
             arange,
             out=positions_np,
         )
+        # Add Sage position offset for concurrent prefill chunks
+        sage_offsets = self.input_batch.sage_position_offset_cpu[req_indices]
+        if np.any(sage_offsets != 0):
+            # Log the sage offset application for debugging
+            unique_req_indices = np.unique(req_indices)
+            for req_idx in unique_req_indices:
+                offset = self.input_batch.sage_position_offset_cpu[req_idx]
+                if offset != 0:
+                    mask = req_indices == req_idx
+                    pos_before = positions_np[mask].copy()
+                    logger.info(
+                        f"[SAGE_OFFSET] Request idx={req_idx}: applying sage_position_offset={offset}, "
+                        f"positions before=[{pos_before[0]}..{pos_before[-1]}], "
+                        f"positions after=[{pos_before[0] + offset}..{pos_before[-1] + offset}]"
+                    )
+            np.add(positions_np, sage_offsets, out=positions_np)
+            logger.info(
+                f"[SAGE_OFFSET] Applied sage offsets to {len(sage_offsets)} tokens. "
+                f"Final position range: [{positions_np[0]}..{positions_np[-1]}]"
+            )
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -3084,12 +3105,31 @@ class GPUModelRunner(
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
+            # Time the forward pass (after blending which happens in kv_connector context)
+            import time as time_module
+            forward_start_event = torch.cuda.Event(enable_timing=True)
+            forward_end_event = torch.cuda.Event(enable_timing=True)
+            forward_start_event.record()
+            forward_wall_start = time_module.perf_counter()
+            
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
+            )
+            
+            forward_end_event.record()
+            torch.cuda.synchronize()
+            forward_wall_time = time_module.perf_counter() - forward_wall_start
+            forward_gpu_time = forward_start_event.elapsed_time(forward_end_event)
+            logger.info(
+                "[FORWARD_TIMING] _model_forward() wall_time=%.3fms, gpu_time=%.3fms "
+                "for %d tokens",
+                forward_wall_time * 1000,
+                forward_gpu_time,
+                num_tokens_padded,
             )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):

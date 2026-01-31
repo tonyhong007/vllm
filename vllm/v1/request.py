@@ -137,6 +137,20 @@ class Request:
 
         self.skip_reading_prefix_cache = self.get_skip_reading_prefix_cache()
 
+        # Concurrent prefill fields
+        self.is_chunk_request: bool = False  # True for chunk prefill requests
+        self.sage_position_offset: int = 0  # Position offset for chunks (used for RoPE)
+        # For parent requests: chunk info for GPU-direct copy
+        # List of (chunk_id, position_offset, num_tokens, block_ids) tuples
+        # block_ids is a list of integers (physical block indices)
+        self.sage_chunk_info: list[tuple[str, int, int, list[int]]] | None = None
+        # True if chunk blocks have been transferred to parent via zero-copy
+        # When True, LMCache should skip any KV loading since blocks are ready
+        self.sage_blocks_transferred: bool = False
+        # Chunk boundary positions for GPU-direct blending (e.g., [0, 2770, 4615, ...])
+        # Used to tell the blender which positions need recomputation
+        self.sage_chunk_boundaries: list[int] | None = None
+
     @classmethod
     def from_engine_core_request(
         cls,

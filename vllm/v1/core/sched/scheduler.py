@@ -5,6 +5,7 @@ import time
 from collections import defaultdict
 from collections.abc import Iterable
 from typing import Any
+import time
 
 from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -212,6 +213,12 @@ class Scheduler(SchedulerInterface):
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
+
+        # Sage concurrent prefill: track chunk requests and their blocks
+        # chunk_id -> parent_id mapping
+        self.sage_chunk_to_parent: dict[str, str] = {}
+        # parent_id -> list of (chunk_id, blocks, num_tokens) tuples
+        self.sage_parent_chunk_blocks: dict[str, list[tuple[str, tuple[list[int], ...], int]]] = {}
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -1345,6 +1352,13 @@ class Scheduler(SchedulerInterface):
         return len(self.running), len(self.waiting)
 
     def add_request(self, request: Request) -> None:
+        start_time = time.time()
+        logger.info(
+            f"Adding request {request.request_id} "
+            f"at time {start_time:.3f}s with "
+            f"{len(request.all_token_ids)} total tokens.",
+        )
+        
         self.waiting.add_request(request)
         self.requests[request.request_id] = request
         if self.log_stats:
@@ -1404,6 +1418,49 @@ class Scheduler(SchedulerInterface):
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
 
+        # Check if this is a Sage chunk request - if so, store blocks instead of freeing
+        if request_id in self.sage_chunk_to_parent:
+            parent_id = self.sage_chunk_to_parent[request_id]
+            # Get block IDs before removing from tracking
+            block_ids = self.kv_cache_manager.get_block_ids(request_id)
+            num_tokens = request.num_computed_tokens
+            num_blocks = len(block_ids[0]) if block_ids and len(block_ids) > 0 else 0
+            # Get position offset for GPU-direct copy
+            position_offset = getattr(request, 'sage_position_offset', 0)
+            
+            # Store the chunk's blocks for later transfer to parent
+            # Include position_offset for GPU-direct copy
+            if parent_id not in self.sage_parent_chunk_blocks:
+                self.sage_parent_chunk_blocks[parent_id] = []
+            self.sage_parent_chunk_blocks[parent_id].append(
+                (request_id, block_ids, num_tokens, position_offset)
+            )
+            
+            logger.info(
+                f"[SAGE_PRESERVE] Chunk {request_id} finished: "
+                f"{num_tokens} tokens, {num_blocks} blocks, position_offset={position_offset} "
+                f"preserved for parent {parent_id}"
+            )
+            
+            # Log block details for verification
+            if block_ids and len(block_ids) > 0:
+                sample_ids = [b.block_id if hasattr(b, 'block_id') else b for b in block_ids[0][:3]]
+                logger.info(f"[SAGE_PRESERVE]   First block IDs: {sample_ids}...")
+            
+            # Verify blocks are still in coordinator
+            coordinator = self.kv_cache_manager.coordinator
+            for manager_idx, manager in enumerate(coordinator.single_type_managers):
+                if request_id in manager.req_to_blocks:
+                    mgr_blocks = manager.req_to_blocks[request_id]
+                    logger.info(
+                        f"[SAGE_PRESERVE]   Manager {manager_idx} has {len(mgr_blocks)} blocks for chunk"
+                    )
+            
+            # Don't free the blocks - just remove from requests dict
+            # The blocks will be transferred to the parent request later
+            del self.requests[request_id]
+            return kv_xfer_params
+
         if not delay_free_blocks:
             self._free_blocks(request)
 
@@ -1413,6 +1470,95 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
         self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
+
+    # ==================== Sage Concurrent Prefill Methods ====================
+
+    def register_sage_chunk(self, chunk_id: str, parent_id: str) -> None:
+        """Register a Sage chunk request with its parent request ID.
+        
+        This is called when a chunk request is created so we can track it
+        and preserve its blocks when it finishes.
+        """
+        self.sage_chunk_to_parent[chunk_id] = parent_id
+        logger.debug(f"Registered Sage chunk {chunk_id} -> parent {parent_id}")
+
+    def has_sage_chunk_blocks(self, parent_id: str) -> bool:
+        """Check if a parent request has chunk blocks waiting to be freed."""
+        return parent_id in self.sage_parent_chunk_blocks
+
+    def transfer_sage_blocks_to_parent_zero_copy(
+        self, parent_id: str
+    ) -> tuple[int, int, list] | None:
+        """Transfer chunk blocks directly to parent - ZERO COPY optimization.
+        
+        This is the optimal approach for Sage concurrent prefill:
+        - Chunks have already computed KV with correct positional encoding (sage_position_offset)
+        - We directly transfer block ownership from chunks to parent
+        - No GPU-to-GPU copy needed at all!
+        
+        Returns:
+            tuple[total_tokens, total_blocks, ordered_blocks] or None if no chunks found
+        """
+        if parent_id not in self.sage_parent_chunk_blocks:
+            return None
+        
+        chunk_block_info = self.sage_parent_chunk_blocks.get(parent_id, [])
+        if not chunk_block_info:
+            return None
+        
+        # Sort by position offset to ensure correct block ordering
+        chunk_block_info.sort(key=lambda x: x[3])  # x[3] is position_offset
+        
+        coordinator = self.kv_cache_manager.coordinator
+        total_tokens = 0
+        total_blocks = 0
+        
+        # Collect all blocks in order, grouped by manager
+        all_ordered_blocks_by_manager = [[] for _ in coordinator.single_type_managers]
+        
+        logger.info(f"[SAGE_ZERO_COPY] Starting zero-copy block transfer for parent {parent_id}")
+        
+        for chunk_id, block_ids_raw, num_tokens, position_offset in chunk_block_info:
+            logger.info(
+                f"[SAGE_ZERO_COPY]   Chunk {chunk_id}: {num_tokens} tokens, "
+                f"position_offset={position_offset}"
+            )
+            
+            # Transfer blocks from each manager
+            for manager_idx, manager in enumerate(coordinator.single_type_managers):
+                chunk_blocks = manager.req_to_blocks.pop(chunk_id, [])
+                if chunk_blocks:
+                    all_ordered_blocks_by_manager[manager_idx].extend(chunk_blocks)
+                    logger.info(
+                        f"[SAGE_ZERO_COPY]     Manager {manager_idx}: transferred {len(chunk_blocks)} blocks"
+                    )
+            
+            total_tokens += num_tokens
+            total_blocks += len(block_ids_raw[0]) if block_ids_raw else 0
+            
+            # Clean up chunk tracking
+            self.sage_chunk_to_parent.pop(chunk_id, None)
+        
+        # Now assign all blocks to parent
+        for manager_idx, manager in enumerate(coordinator.single_type_managers):
+            if all_ordered_blocks_by_manager[manager_idx]:
+                manager.req_to_blocks[parent_id] = all_ordered_blocks_by_manager[manager_idx]
+                logger.info(
+                    f"[SAGE_ZERO_COPY]   Assigned {len(all_ordered_blocks_by_manager[manager_idx])} "
+                    f"blocks to parent in manager {manager_idx}"
+                )
+        
+        # Clear from sage_parent_chunk_blocks since we've transferred
+        self.sage_parent_chunk_blocks.pop(parent_id, None)
+        
+        logger.info(
+            f"[SAGE_ZERO_COPY] Complete: {total_tokens} tokens, {total_blocks} blocks "
+            f"transferred to parent {parent_id}"
+        )
+        
+        return total_tokens, total_blocks, all_ordered_blocks_by_manager
+
+    # ==================== End Sage Concurrent Prefill Methods ====================
 
     def get_num_unfinished_requests(self) -> int:
         return len(self.waiting) + len(self.running)
