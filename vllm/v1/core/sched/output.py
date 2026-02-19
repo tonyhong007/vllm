@@ -51,6 +51,8 @@ class NewRequestData:
     sage_blocks_transferred: bool = False
     # Chunk boundary positions for GPU-direct blending (e.g., [0, 2770, 4615, ...])
     sage_chunk_boundaries: list[int] | None = None
+    # Whether RoPE adjustment is needed during blending (True when chunks prefilled at position 0)
+    sage_needs_rope_adjustment: bool = False
 
     @classmethod
     def from_request(
@@ -72,6 +74,7 @@ class NewRequestData:
             prefill_token_ids=prefill_token_ids,
             sage_blocks_transferred=getattr(request, "sage_blocks_transferred", False),
             sage_chunk_boundaries=getattr(request, "sage_chunk_boundaries", None),
+            sage_needs_rope_adjustment=getattr(request, "sage_needs_rope_adjustment", False),
         )
 
     def __repr__(self) -> str:

@@ -489,11 +489,34 @@ class Scheduler(SchedulerInterface):
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
-                        ext_tokens, load_kv_async = (
-                            self.connector.get_num_new_matched_tokens(
-                                request, num_new_local_computed_tokens
+                        # Sage: chunk requests are freshly-split tokens
+                        # that will never have an LMCache hit. Skip the
+                        # lookup entirely to avoid unnecessary overhead.
+                        if getattr(request, 'is_chunk_request', False):
+                            logger.debug(
+                                "[SAGE] Skipping LMCache lookup for "
+                                "chunk request %s",
+                                request.request_id,
                             )
-                        )
+                            ext_tokens = 0
+                            load_kv_async = False
+                        else:
+                            # DEBUG: Log before calling get_num_new_matched_tokens
+                            logger.info(
+                                "[DEBUG_SCHED] Calling get_num_new_matched_tokens for %s: "
+                                "status=%s, num_tokens=%d, num_computed_tokens=%d, "
+                                "num_new_local_computed=%d",
+                                request.request_id,
+                                request.status,
+                                request.num_tokens,
+                                request.num_computed_tokens,
+                                num_new_local_computed_tokens,
+                            )
+                            ext_tokens, load_kv_async = (
+                                self.connector.get_num_new_matched_tokens(
+                                    request, num_new_local_computed_tokens
+                                )
+                            )
 
                         if ext_tokens is None:
                             # The request cannot be scheduled because
@@ -599,6 +622,15 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+                    logger.info(
+                        "[DEBUG_SCHED] Allocation FAILED for %s: "
+                        "num_new_tokens=%d, num_external_computed_tokens=%d, "
+                        "total_to_alloc=%d",
+                        request.request_id,
+                        num_new_tokens,
+                        num_external_computed_tokens,
+                        num_new_tokens + num_external_computed_tokens,
+                    )
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -606,11 +638,22 @@ class Scheduler(SchedulerInterface):
                 # This information is used to determine if a load is
                 # needed for this request.
                 if self.connector is not None:
-                    self.connector.update_state_after_alloc(
-                        request,
-                        new_computed_blocks + new_blocks,
-                        num_external_computed_tokens,
-                    )
+                    if getattr(request, 'is_chunk_request', False):
+                        logger.debug(
+                            "[SAGE] Skipping update_state_after_alloc "
+                            "for chunk request %s",
+                            request.request_id,
+                        )
+                    else:
+                        logger.info(
+                            "[DEBUG_SCHED] Allocation SUCCESS for %s, calling update_state_after_alloc",
+                            request.request_id,
+                        )
+                        self.connector.update_state_after_alloc(
+                            request,
+                            new_computed_blocks + new_blocks,
+                            num_external_computed_tokens,
+                        )
 
                 # Request was already popped from self.waiting
                 # unless it was re-added above due to new_blocks being None.
@@ -625,6 +668,11 @@ class Scheduler(SchedulerInterface):
                 self._update_connector_prefix_cache_stats(request)
 
                 self.running.append(request)
+                logger.info(
+                    "[DEBUG_SCHED] Request %s moved to RUNNING, num_new_tokens=%d",
+                    request.request_id,
+                    num_new_tokens,
+                )
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
@@ -775,6 +823,10 @@ class Scheduler(SchedulerInterface):
         """
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
+        )
+        logger.info(
+            "[DEBUG_SCHED] Request %s is being PREEMPTED, resetting num_computed_tokens to 0",
+            request.request_id,
         )
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
@@ -1356,9 +1408,11 @@ class Scheduler(SchedulerInterface):
         logger.info(
             f"Adding request {request.request_id} "
             f"at time {start_time:.3f}s with "
-            f"{len(request.all_token_ids)} total tokens.",
+            f"{len(request.all_token_ids)} total tokens, "
+            f"num_computed_tokens={request.num_computed_tokens}, "
+            f"status={request.status}.",
         )
-        
+
         self.waiting.add_request(request)
         self.requests[request.request_id] = request
         if self.log_stats:
@@ -1486,6 +1540,34 @@ class Scheduler(SchedulerInterface):
         """Check if a parent request has chunk blocks waiting to be freed."""
         return parent_id in self.sage_parent_chunk_blocks
 
+    def free_sage_chunk_blocks(self, parent_id: str) -> None:
+        """Free chunk blocks when using CPU path (not zero-copy).
+
+        When using the CPU path for blending, chunk KV is retrieved from LMCache
+        (CPU/disk), so we don't need the GPU blocks anymore. This method frees
+        those blocks to prevent memory exhaustion.
+        """
+        if parent_id not in self.sage_parent_chunk_blocks:
+            logger.debug(f"No chunk blocks to free for parent {parent_id}")
+            return
+
+        chunk_block_info = self.sage_parent_chunk_blocks.pop(parent_id)
+        total_blocks_freed = 0
+
+        for chunk_id, block_ids, num_tokens, position_offset in chunk_block_info:
+            # Free the blocks in the KV cache manager
+            self.kv_cache_manager.coordinator.free(chunk_id)
+            num_blocks = len(block_ids[0]) if block_ids and len(block_ids) > 0 else 0
+            total_blocks_freed += num_blocks
+            logger.info(
+                f"[SAGE_FREE] Freed {num_blocks} blocks for chunk {chunk_id} "
+                f"(parent {parent_id})"
+            )
+
+        logger.info(
+            f"[SAGE_FREE] Total: freed {total_blocks_freed} blocks for parent {parent_id}"
+        )
+
     def transfer_sage_blocks_to_parent_zero_copy(
         self, parent_id: str
     ) -> tuple[int, int, list] | None:
@@ -1543,6 +1625,20 @@ class Scheduler(SchedulerInterface):
         for manager_idx, manager in enumerate(coordinator.single_type_managers):
             if all_ordered_blocks_by_manager[manager_idx]:
                 manager.req_to_blocks[parent_id] = all_ordered_blocks_by_manager[manager_idx]
+                # Count blocks already cached (have block_hash set) to prevent
+                # cache_full_blocks from re-caching them and hitting
+                # assert blk.block_hash is None
+                num_already_cached = sum(
+                    1 for blk in all_ordered_blocks_by_manager[manager_idx]
+                    if blk.block_hash is not None
+                )
+                if num_already_cached > 0:
+                    manager.num_cached_block[parent_id] = num_already_cached
+                    logger.info(
+                        f"[SAGE_ZERO_COPY]   Manager {manager_idx}: "
+                        f"{num_already_cached} blocks already cached, "
+                        f"set num_cached_block to skip re-caching"
+                    )
                 logger.info(
                     f"[SAGE_ZERO_COPY]   Assigned {len(all_ordered_blocks_by_manager[manager_idx])} "
                     f"blocks to parent in manager {manager_idx}"

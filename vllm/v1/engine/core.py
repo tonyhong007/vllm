@@ -217,11 +217,16 @@ class EngineCore:
         self.sage_skip_rope_adjustment = os.environ.get(
             "SAGE_SKIP_ROPE_ADJUSTMENT", "False"
         ).lower() == "true"
+        
+        self.enable_gpu_blending = os.environ.get(
+            "ENABLE_GPU_BLEND", "False"
+        ).lower() == "true"
 
         # Concurrent prefill state tracking
         self.chunk_groups: dict[str, list[str]] = {}  # parent_req_id -> [chunk_req_ids]
         self.chunk_completion: dict[str, set[str]] = {}  # parent_req_id -> completed chunks
         self.parent_requests: dict[str, Request] = {}  # parent_req_id -> original Request
+        self.chunk_lengths: dict[str, int] = {}  # chunk_req_id -> chunk token length
         self.chunk_to_parent: dict[str, str] = {}  # chunk_req_id -> parent_req_id
         self._separator_token_ids: Optional[list[int]] = None
 
@@ -673,16 +678,18 @@ class EngineCore:
 
     def _find_separator_positions(
         self, prompt_tokens: list[int], sep_tokens: list[int]
-    ) -> list[tuple[int, int]]:
+    ) -> tuple[list[tuple[int, int]], list[int]]:
         """Find positions of separator tokens and return chunk boundaries.
 
-        Returns list of (start, end) tuples representing each chunk's token range.
+        Returns:
+            positions: list of (start, end) tuples representing each chunk's token range
+                in the original prompt token space
+            split_tokens: original prompt tokens (separator tokens preserved)
         """
         if not sep_tokens:
-            return [(0, len(prompt_tokens))]
+            return [(0, len(prompt_tokens))], prompt_tokens
 
         sep_len = len(sep_tokens)
-        positions = []
 
         # Find all separator positions
         sep_positions = []
@@ -690,19 +697,23 @@ class EngineCore:
             if prompt_tokens[i:i + sep_len] == sep_tokens:
                 sep_positions.append(i)
 
-        # Build chunk boundaries
+        # Build chunk boundaries directly in original prompt token space,
+        # preserving separator tokens in chunk payloads.
+        positions = []
         start = 0
-        for sep_pos in sep_positions:
-            if sep_pos > start:
-                # Chunk from start to separator (inclusive of separator)
-                positions.append((start, sep_pos + sep_len))
-            start = sep_pos + sep_len
 
-        # Add final chunk (from last separator to end)
+        for sep_pos in sep_positions:
+            # Keep separator tokens by attaching them to the preceding chunk.
+            end = sep_pos + sep_len
+            if end > start:
+                positions.append((start, end))
+            start = end
+
+        # Add final chunk (from last separator to end of prompt)
         if start < len(prompt_tokens):
             positions.append((start, len(prompt_tokens)))
 
-        return positions
+        return positions, prompt_tokens
 
     def _create_chunk_request(
         self, parent_request: Request, chunk_id: str, chunk_tokens: list[int],
@@ -734,9 +745,26 @@ class EngineCore:
             priority=parent_request.priority,
             block_hasher=self.request_block_hasher,
         )
-        # Mark as chunk request and set position offset for correct rotary embeddings
+        # Mark as chunk request
         chunk_request.is_chunk_request = True
-        chunk_request.sage_position_offset = position_offset
+        
+        # Set position offset for correct rotary embeddings during prefill
+        # When sage_skip_rope_adjustment=True: inject position offset during prefill (optimization)
+        # When sage_skip_rope_adjustment=False: don't inject offset, RoPE adjustment done during blending
+        if self.sage_skip_rope_adjustment:
+            logger.info(
+                "Setting sage_position_offset=%d for chunk %s",
+                position_offset, chunk_id
+            )
+            chunk_request.sage_position_offset = position_offset
+        else:
+            # Each chunk prefills starting at position 0; RoPE adjustment happens during blending
+            logger.info(
+                "Setting sage_position_offset=0 for chunk %s (RoPE adjustment during blending)",
+                chunk_id
+            )
+            chunk_request.sage_position_offset = 0
+        
         return chunk_request
 
     def _split_request_into_chunks(self, request: Request) -> list[Request]:
@@ -745,23 +773,25 @@ class EngineCore:
 
         # Find separator positions in prompt_token_ids
         prompt_tokens = list(request.prompt_token_ids) if request.prompt_token_ids else []
-        split_positions = self._find_separator_positions(prompt_tokens, sep_tokens)
+        split_positions, split_tokens = self._find_separator_positions(
+            prompt_tokens, sep_tokens
+        )
 
         if len(split_positions) <= 1:
             # No split needed, return original request
             return []
 
-        # Create chunk requests
+        # Create chunk requests directly from original tokens (separators preserved)
         chunk_requests = []
         for i, (start, end) in enumerate(split_positions):
             current_time = time.time()
             chunk_id = f"{request.request_id}_chunk_{i}"
-            chunk_tokens = prompt_tokens[start:end]
+            chunk_tokens = split_tokens[start:end]
             chunk_req = self._create_chunk_request(request, chunk_id, chunk_tokens, start)
             chunk_requests.append(chunk_req)
             logger.info(
-                "Created chunk %s with %d tokens (positions %d-%d), position_offset=%d at time %.2f",
-                chunk_id, len(chunk_tokens), start, end, start, current_time
+                "Created chunk %s with %d tokens (positions %d-%d), sage_position_offset=%d at time %.2f",
+                chunk_id, len(chunk_tokens), start, end, chunk_req.sage_position_offset, current_time
             )
 
         # Track parent-child relationships
@@ -772,18 +802,22 @@ class EngineCore:
             self.chunk_to_parent[c.request_id] = request.request_id
             # Register chunk with scheduler so it preserves blocks when chunk finishes
             self.scheduler.register_sage_chunk(c.request_id, request.request_id)
+            # Store chunk length for computing boundaries during blending
+            # This is needed when we don't know positions during prefill (SAGE_SKIP_ROPE_ADJUSTMENT=False)
+            self.chunk_lengths[c.request_id] = len(c.prompt_token_ids)
 
         logger.info(
             "Split request %s into %d chunks",
             request.request_id, len(chunk_requests)
         )
-
-        # Store chunk boundaries on parent request for GPU-direct blending
-        # Boundaries are the starting positions of each chunk
-        request.sage_chunk_boundaries = [start for start, end in split_positions]
-        logger.info(
-            f"[SAGE_BLEND] Stored chunk_boundaries on parent: {request.sage_chunk_boundaries}"
-        )
+        
+        if self.sage_skip_rope_adjustment:
+            # Store chunk boundaries on parent request for GPU-direct blending
+            # Boundaries are the starting positions of each chunk
+            request.sage_chunk_boundaries = [start for start, end in split_positions]
+            logger.info(
+                f"[SAGE_BLEND] Stored chunk_boundaries on parent: {request.sage_chunk_boundaries}"
+            )
 
         return chunk_requests
 
@@ -822,20 +856,46 @@ class EngineCore:
     def _launch_final_request(self, parent_id: str) -> None:
         """Launch final request for generation after chunk prefilling.
 
-        ZERO-COPY approach (optimized):
+        ZERO-COPY approach:
         1. Transfer chunk blocks directly to parent (no GPU copy needed!)
         2. Set num_computed_tokens so scheduler knows most tokens are done
         3. Parent uses transferred blocks directly for decode
-        4. No data movement - blocks already have KV with correct positions
-           (sage_position_offset ensures correct RoPE during chunk prefill)
+        
+        When sage_skip_rope_adjustment=True (optimization mode):
+        - Chunks were prefilled with correct position offsets
+        - No RoPE adjustment needed during blending
+        
+        When sage_skip_rope_adjustment=False (general mode):
+        - Chunks were prefilled starting at position 0 (no position knowledge)
+        - RoPE adjustment IS needed during blending to correct positions
         """
         parent_request = self.parent_requests[parent_id]
         prompt_len = len(parent_request.prompt_token_ids)
         
-        transfer_result = None
-        if self.sage_skip_rope_adjustment:
-            # ZERO-COPY: Transfer chunk blocks directly to parent
+        # Compute chunk boundaries for RoPE adjustment during blending
+        # Only needed when SAGE_SKIP_ROPE_ADJUSTMENT=False (chunks prefilled at position 0)
+        # When SAGE_SKIP_ROPE_ADJUSTMENT=True, boundaries are already set from separator
+        # positions in _split_request_into_chunks and RoPE adjustment isn't needed
+        if not self.sage_skip_rope_adjustment:
+            chunk_ids = self.chunk_groups.get(parent_id, [])
+            chunk_boundaries = [0]
+            position = 0
+            for chunk_id in chunk_ids:
+                chunk_len = self.chunk_lengths.get(chunk_id, 0)
+                position += chunk_len
+                chunk_boundaries.append(position)
+            # Remove the last boundary (it's the total length, not a chunk start)
+            chunk_boundaries = chunk_boundaries[:-1]
+            parent_request.sage_chunk_boundaries = chunk_boundaries
+            logger.info(
+                f"[SAGE_BLEND] Computed chunk_boundaries from chunk lengths: {chunk_boundaries}"
+            )
+        
+        # Always do zero-copy transfer when SAGE is enabled
+        if self.enable_gpu_blending:
             transfer_result = self.scheduler.transfer_sage_blocks_to_parent_zero_copy(parent_id)
+        else:
+            transfer_result = None
             
         if transfer_result:
             total_tokens, total_blocks, _ = transfer_result
@@ -858,9 +918,18 @@ class EngineCore:
         else:
             logger.info(
                 f"Parent request {parent_id}: prompt_len={prompt_len}, "
-                f"no chunk blocks (will prefill normally)"
+                f"using CPU path (will retrieve from LMCache)"
             )
             parent_request.sage_blocks_transferred = False
+            # Free chunk blocks since we're using CPU path - KV will be retrieved from LMCache
+            self.scheduler.free_sage_chunk_blocks(parent_id)
+
+        # Set flag indicating whether RoPE adjustment is needed during blending
+        # This is needed when we don't know chunk positions at prefill time
+        parent_request.sage_needs_rope_adjustment = not self.sage_skip_rope_adjustment
+        logger.info(
+            f"[SAGE] Parent {parent_id}: sage_needs_rope_adjustment={parent_request.sage_needs_rope_adjustment}"
+        )
 
         # Add parent request to scheduler
         # Since blocks are already in req_to_blocks, allocate_slots will only
@@ -895,6 +964,7 @@ class EngineCore:
         # Clean up chunk tracking
         for chunk_id in chunk_ids:
             self.chunk_to_parent.pop(chunk_id, None)
+            self.chunk_lengths.pop(chunk_id, None)
 
         # Clean up parent tracking
         self.chunk_groups.pop(parent_id, None)

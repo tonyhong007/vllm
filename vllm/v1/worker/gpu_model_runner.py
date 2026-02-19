@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
@@ -3105,32 +3106,41 @@ class GPUModelRunner(
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
-            # Time the forward pass (after blending which happens in kv_connector context)
-            import time as time_module
-            forward_start_event = torch.cuda.Event(enable_timing=True)
-            forward_end_event = torch.cuda.Event(enable_timing=True)
-            forward_start_event.record()
-            forward_wall_start = time_module.perf_counter()
-            
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
-            
-            forward_end_event.record()
-            torch.cuda.synchronize()
-            forward_wall_time = time_module.perf_counter() - forward_wall_start
-            forward_gpu_time = forward_start_event.elapsed_time(forward_end_event)
-            logger.info(
-                "[FORWARD_TIMING] _model_forward() wall_time=%.3fms, gpu_time=%.3fms "
-                "for %d tokens",
-                forward_wall_time * 1000,
-                forward_gpu_time,
-                num_tokens_padded,
-            )
+            sage_enable_timing = os.getenv("SAGE_ENABLE_TIMING", "0").lower() == "1"
+            if sage_enable_timing:
+                # Time the forward pass (after blending which happens in kv_connector context)
+                forward_start_event = torch.cuda.Event(enable_timing=True)
+                forward_end_event = torch.cuda.Event(enable_timing=True)
+                forward_start_event.record()
+                forward_wall_start = time.perf_counter()
+
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+
+                forward_end_event.record()
+                torch.cuda.synchronize()
+                forward_wall_time = time.perf_counter() - forward_wall_start
+                forward_gpu_time = forward_start_event.elapsed_time(forward_end_event)
+                logger.info(
+                    "[FORWARD_TIMING] _model_forward() wall_time=%.3fms, gpu_time=%.3fms "
+                    "for %d tokens",
+                    forward_wall_time * 1000,
+                    forward_gpu_time,
+                    num_tokens_padded,
+                )
+            else:
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
