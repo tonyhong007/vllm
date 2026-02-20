@@ -9,6 +9,7 @@ from typing import Any
 import msgspec
 import torch
 
+from vllm.inputs import RequestType
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
@@ -74,6 +75,10 @@ class EngineCoreRequest(
     priority: int = 0
 
     trace_headers: Mapping[str, str] | None = None
+    request_type: RequestType = "sequential"
+    parent_request_id: str | None = None
+    chunk_id: int | None = None
+    is_final_chunk: bool = False
 
     @property
     def params(self) -> SamplingParams | PoolingParams:

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from vllm.inputs import RequestType
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
@@ -44,6 +45,10 @@ class Request:
         priority: int = 0,
         trace_headers: Mapping[str, str] | None = None,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
+        request_type: RequestType = "sequential",
+        parent_request_id: str | None = None,
+        chunk_id: int | None = None,
+        is_final_chunk: bool = False,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -115,6 +120,10 @@ class Request:
         self.all_token_ids = ConstantList(self._all_token_ids)
         # trace_headers
         self.trace_headers = trace_headers
+        self.request_type: RequestType = request_type
+        self.parent_request_id = parent_request_id
+        self.chunk_id = chunk_id
+        self.is_final_chunk = is_final_chunk
         # State
         # The number of tokens with prefix cache hits.
         self.num_cached_tokens = -1
@@ -172,6 +181,10 @@ class Request:
             priority=request.priority,
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
+            request_type=request.request_type,
+            parent_request_id=request.parent_request_id,
+            chunk_id=request.chunk_id,
+            is_final_chunk=request.is_final_chunk,
         )
 
     def append_output_token_ids(

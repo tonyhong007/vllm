@@ -53,6 +53,7 @@ from vllm.entrypoints.utils import _validate_truncation_size, log_non_default_ar
 from vllm.inputs import (
     DataPrompt,
     PromptType,
+    RequestType,
     SingletonPrompt,
     TextPrompt,
     TokensPrompt,
@@ -445,6 +446,12 @@ class LLM:
             lora_request=lora_request,
             priority=priority,
         )
+
+        # For non-final concurrent chunks, enqueue the request and kick a single
+        # engine step to start scheduling/prefill, but do not block for completion.
+        if self._should_return_early_for_non_final_concurrent(prompts):
+            self.llm_engine.step()
+            return []
 
         outputs = self._run_engine(use_tqdm=use_tqdm)
         return self.engine_class.validate_outputs(outputs, RequestOutput)
@@ -1716,10 +1723,26 @@ class LLM:
         tokenization_kwargs: dict[str, Any] | None = None,
     ) -> str:
         prompt_text, _, _ = get_prompt_components(prompt)
-        request_id = str(next(self.request_counter))
+        (
+            request_type,
+            request_id,
+            chunk_id,
+            _is_final_chunk,
+        ) = self._extract_request_metadata(prompt)
+
+        if request_id is None:
+            base_request_id = str(next(self.request_counter))
+        else:
+            base_request_id = request_id
+
+        if request_type == "concurrent":
+            assert chunk_id is not None
+            engine_request_id = f"{base_request_id}_chunk_{chunk_id}"
+        else:
+            engine_request_id = base_request_id
 
         engine_request, tokenization_kwargs = self._process_inputs(
-            request_id,
+            engine_request_id,
             prompt,
             params,
             lora_request=lora_request,
@@ -1728,7 +1751,7 @@ class LLM:
         )
 
         self.llm_engine.add_request(
-            request_id,
+            engine_request_id,
             engine_request,
             params,
             lora_request=lora_request,
@@ -1736,7 +1759,88 @@ class LLM:
             priority=priority,
             prompt_text=prompt_text,
         )
-        return request_id
+        return engine_request_id
+
+    def _extract_request_metadata(
+        self, prompt: PromptType
+    ) -> tuple[RequestType, str | None, int | None, bool]:
+        request_type: RequestType = "sequential"
+        request_id: str | None = None
+        chunk_id: int | None = None
+        is_final_chunk = False
+
+        if not isinstance(prompt, dict):
+            return request_type, request_id, chunk_id, is_final_chunk
+
+        if "request_type" in prompt and prompt["request_type"] is not None:
+            raw_request_type = str(prompt["request_type"]).lower()
+            if raw_request_type not in ("sequential", "concurrent"):
+                raise ValueError(
+                    "request_type must be either 'sequential' or 'concurrent'."
+                )
+            request_type = cast(RequestType, raw_request_type)
+
+        if "request_id" in prompt and prompt["request_id"] is not None:
+            request_id = str(prompt["request_id"])
+
+        if "chunk_id" in prompt and prompt["chunk_id"] is not None:
+            raw_chunk_id = prompt["chunk_id"]
+            if not isinstance(raw_chunk_id, int):
+                raise TypeError("chunk_id must be an integer.")
+            chunk_id = raw_chunk_id
+
+        if "is_final_chunk" in prompt and prompt["is_final_chunk"] is not None:
+            raw_final = prompt["is_final_chunk"]
+            if not isinstance(raw_final, bool):
+                raise TypeError("is_final_chunk must be a boolean.")
+            is_final_chunk = raw_final
+
+        if request_type == "concurrent":
+            if request_id is None:
+                raise ValueError(
+                    "concurrent requests must provide request_id in the prompt."
+                )
+            if chunk_id is None:
+                raise ValueError(
+                    "concurrent requests must provide chunk_id."
+                )
+        else:
+            if request_id is not None or chunk_id is not None or is_final_chunk:
+                raise ValueError(
+                    "sequential requests must not include request_id, "
+                    "chunk_id, or is_final_chunk."
+                )
+
+        return request_type, request_id, chunk_id, is_final_chunk
+
+    def _should_return_early_for_non_final_concurrent(
+        self, prompts: PromptType | Sequence[PromptType] | DataPrompt
+    ) -> bool:
+        if isinstance(prompts, (str, dict)):
+            prompts = [prompts]  # type: ignore[list-item]
+
+        has_prompt = False
+        for prompt in prompts:
+            has_prompt = True
+            request_type, _, _, is_final_chunk = self._extract_request_metadata(prompt)
+            if request_type != "concurrent" or is_final_chunk:
+                return False
+        return has_prompt
+
+    @staticmethod
+    def _is_concurrent_chunk_output(
+        output: RequestOutput | PoolingRequestOutput,
+    ) -> bool:
+        return "_chunk_" in output.request_id
+
+    @staticmethod
+    def _request_output_sort_key(
+        output: RequestOutput | PoolingRequestOutput,
+    ) -> tuple[int, int | str]:
+        request_id = output.request_id
+        if request_id.isdigit():
+            return (0, int(request_id))
+        return (1, request_id)
 
     def _run_engine(
         self, *, use_tqdm: bool | Callable[..., tqdm] = True
@@ -1759,6 +1863,12 @@ class LLM:
         while self.llm_engine.has_unfinished_requests():
             step_outputs = self.llm_engine.step()
             for output in step_outputs:
+                if self._is_concurrent_chunk_output(output):
+                    logger.info(
+                        "Suppressing output for concurrent chunk request %s",
+                        output.request_id,
+                    )
+                    continue
                 if output.finished:
                     outputs.append(output)
                     if use_tqdm:
@@ -1787,4 +1897,4 @@ class LLM:
         # Sort the outputs by request ID.
         # This is necessary because some requests may be finished earlier than
         # its previous requests.
-        return sorted(outputs, key=lambda x: int(x.request_id))
+        return sorted(outputs, key=self._request_output_sort_key)

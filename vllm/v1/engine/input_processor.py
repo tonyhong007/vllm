@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from typing import Any, Literal, cast
 
 from vllm.config import VllmConfig
-from vllm.inputs import ProcessorInputs, PromptType, SingletonInputs
+from vllm.inputs import ProcessorInputs, PromptType, RequestType, SingletonInputs
 from vllm.inputs.parse import split_enc_dec_inputs
 from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
@@ -389,6 +389,56 @@ class InputProcessor:
             mm_uuids[modality] = [f"{request_id}-{modality}-{i}" for i in range(n)]
         return mm_uuids
 
+    def _extract_request_metadata(
+        self, prompt: PromptType
+    ) -> tuple[RequestType, str | None, int | None, bool]:
+        request_type: RequestType = "sequential"
+        parent_request_id: str | None = None
+        chunk_id: int | None = None
+        is_final_chunk = False
+
+        if not isinstance(prompt, dict):
+            return request_type, parent_request_id, chunk_id, is_final_chunk
+
+        if "request_type" in prompt and prompt["request_type"] is not None:
+            raw_request_type = str(prompt["request_type"]).lower()
+            if raw_request_type not in ("sequential", "concurrent"):
+                raise ValueError(
+                    "request_type must be either 'sequential' or 'concurrent'."
+                )
+            request_type = cast(RequestType, raw_request_type)
+
+        if "request_id" in prompt and prompt["request_id"] is not None:
+            parent_request_id = str(prompt["request_id"])
+
+        if "chunk_id" in prompt and prompt["chunk_id"] is not None:
+            raw_chunk_id = prompt["chunk_id"]
+            if not isinstance(raw_chunk_id, int):
+                raise TypeError("chunk_id must be an integer.")
+            chunk_id = raw_chunk_id
+
+        if "is_final_chunk" in prompt and prompt["is_final_chunk"] is not None:
+            raw_final = prompt["is_final_chunk"]
+            if not isinstance(raw_final, bool):
+                raise TypeError("is_final_chunk must be a boolean.")
+            is_final_chunk = raw_final
+
+        if request_type == "concurrent":
+            if parent_request_id is None:
+                raise ValueError(
+                    "concurrent requests must provide request_id in the prompt."
+                )
+            if chunk_id is None:
+                raise ValueError("concurrent requests must provide chunk_id.")
+        else:
+            if parent_request_id is not None or chunk_id is not None or is_final_chunk:
+                raise ValueError(
+                    "sequential requests must not include request_id, "
+                    "chunk_id, or is_final_chunk."
+                )
+
+        return request_type, parent_request_id, chunk_id, is_final_chunk
+
     def process_inputs(
         self,
         request_id: str,
@@ -415,6 +465,13 @@ class InputProcessor:
 
         if arrival_time is None:
             arrival_time = time.time()
+
+        (
+            request_type,
+            parent_request_id,
+            chunk_id,
+            is_final_chunk,
+        ) = self._extract_request_metadata(prompt)
 
         # Optionally generate multimodal hash overrides to avoid hashing
         # multimodal data items by their content as their identifiers.
@@ -528,6 +585,10 @@ class InputProcessor:
             priority=priority,
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,
+            request_type=request_type,
+            parent_request_id=parent_request_id,
+            chunk_id=chunk_id,
+            is_final_chunk=is_final_chunk,
         )
 
     def _validate_model_inputs(

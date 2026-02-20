@@ -258,6 +258,20 @@ class LLMEngine:
         # Use cloned params that may have been updated in process_inputs()
         params = request.params
 
+        # Concurrent Sage ingestion path:
+        # - Non-final chunks should not emit user-visible outputs.
+        # - Final chunks should emit only the blended parent output.
+        # Register output tracking only for the parent request id on final chunk.
+        if request.request_type == "concurrent":
+            if request.is_final_chunk and request.parent_request_id is not None:
+                parent_output_request = copy(request)
+                parent_output_request.request_id = request.parent_request_id
+                self.output_processor.add_request(
+                    parent_output_request, prompt_text, None, 0
+                )
+            self.engine_core.add_request(request)
+            return
+
         n = params.n if isinstance(params, SamplingParams) else 1
 
         if n == 1:

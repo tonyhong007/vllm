@@ -17,6 +17,8 @@ else:
     MultiModalInputs = object
     MultiModalUUIDDict = object
 
+RequestType: TypeAlias = Literal["sequential", "concurrent"]
+
 
 class TextPrompt(TypedDict):
     """Schema for a text prompt."""
@@ -90,6 +92,33 @@ class TokensPrompt(TypedDict):
     cache_salt: NotRequired[str]
     """
     Optional cache salt to be used for prefix caching.
+    """
+
+    request_type: NotRequired[RequestType]
+    """
+    Optional Sage request mode.
+    """
+
+    request_id: NotRequired[str | int]
+    """
+    Optional user-provided request ID. If set, vLLM uses this value
+    (or a derived chunk ID for concurrent chunks) as the internal request ID.
+    Required when request_type="concurrent".
+    Must be omitted when request_type="sequential".
+    """
+
+    chunk_id: NotRequired[int]
+    """
+    Optional chunk index for Sage concurrent chunk requests.
+    Required when request_type="concurrent".
+    Must be omitted when request_type="sequential".
+    """
+
+    is_final_chunk: NotRequired[bool]
+    """
+    Optional marker for Sage concurrent mode. True indicates the last chunk
+    submission for the logical request.
+    Must be omitted when request_type="sequential".
     """
 
 
