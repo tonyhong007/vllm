@@ -128,6 +128,10 @@ class LLMEngine:
             # for v0 compatibility
             self.model_executor = self.engine_core.engine_core.model_executor  # type: ignore
 
+        # Track parent output registration for concurrent chunk requests so
+        # exactly one user-visible output state is created per parent request.
+        self.concurrent_parent_output_registered: set[str] = set()
+
         if self.external_launcher_dp:
             # If we use DP in external launcher mode, we reuse the
             # existing DP group used for data communication.
@@ -259,16 +263,20 @@ class LLMEngine:
         params = request.params
 
         # Concurrent Sage ingestion path:
-        # - Non-final chunks should not emit user-visible outputs.
-        # - Final chunks should emit only the blended parent output.
-        # Register output tracking only for the parent request id on final chunk.
+        # - Chunk requests should not emit user-visible outputs.
+        # - Only the blended parent request emits a user-visible output.
+        # Register output tracking exactly once per parent request id.
         if request.request_type == "concurrent":
-            if request.is_final_chunk and request.parent_request_id is not None:
+            if request.parent_request_id is not None and (
+                request.parent_request_id
+                not in self.concurrent_parent_output_registered
+            ):
                 parent_output_request = copy(request)
                 parent_output_request.request_id = request.parent_request_id
                 self.output_processor.add_request(
                     parent_output_request, prompt_text, None, 0
                 )
+                self.concurrent_parent_output_registered.add(request.parent_request_id)
             self.engine_core.add_request(request)
             return
 
@@ -315,6 +323,11 @@ class LLMEngine:
                 iteration_stats=iteration_stats,
             )
             self.output_processor.update_scheduler_stats(outputs.scheduler_stats)
+            if outputs.finished_requests is not None:
+                for finished_request_id in outputs.finished_requests:
+                    self.concurrent_parent_output_registered.discard(
+                        finished_request_id
+                    )
 
         # 3) Abort any reqs that finished due to stop strings.
         with record_function_or_nullcontext("llm_engine step: abort_requests"):

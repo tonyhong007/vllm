@@ -78,7 +78,7 @@ class EngineCoreRequest(
     request_type: RequestType = "sequential"
     parent_request_id: str | None = None
     chunk_id: int | None = None
-    is_final_chunk: bool = False
+    total_chunks: int | None = None
 
     @property
     def params(self) -> SamplingParams | PoolingParams:

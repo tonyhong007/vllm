@@ -391,14 +391,14 @@ class InputProcessor:
 
     def _extract_request_metadata(
         self, prompt: PromptType
-    ) -> tuple[RequestType, str | None, int | None, bool]:
+    ) -> tuple[RequestType, str | None, int | None, int | None]:
         request_type: RequestType = "sequential"
         parent_request_id: str | None = None
         chunk_id: int | None = None
-        is_final_chunk = False
+        total_chunks: int | None = None
 
         if not isinstance(prompt, dict):
-            return request_type, parent_request_id, chunk_id, is_final_chunk
+            return request_type, parent_request_id, chunk_id, total_chunks
 
         if "request_type" in prompt and prompt["request_type"] is not None:
             raw_request_type = str(prompt["request_type"]).lower()
@@ -417,11 +417,13 @@ class InputProcessor:
                 raise TypeError("chunk_id must be an integer.")
             chunk_id = raw_chunk_id
 
-        if "is_final_chunk" in prompt and prompt["is_final_chunk"] is not None:
-            raw_final = prompt["is_final_chunk"]
-            if not isinstance(raw_final, bool):
-                raise TypeError("is_final_chunk must be a boolean.")
-            is_final_chunk = raw_final
+        if "total_chunks" in prompt and prompt["total_chunks"] is not None:
+            raw_total_chunks = prompt["total_chunks"]
+            if not isinstance(raw_total_chunks, int):
+                raise TypeError("total_chunks must be an integer.")
+            if raw_total_chunks <= 0:
+                raise ValueError("total_chunks must be greater than 0.")
+            total_chunks = raw_total_chunks
 
         if request_type == "concurrent":
             if parent_request_id is None:
@@ -430,14 +432,20 @@ class InputProcessor:
                 )
             if chunk_id is None:
                 raise ValueError("concurrent requests must provide chunk_id.")
+            if total_chunks is None:
+                raise ValueError("concurrent requests must provide total_chunks.")
         else:
-            if parent_request_id is not None or chunk_id is not None or is_final_chunk:
+            if (
+                parent_request_id is not None
+                or chunk_id is not None
+                or total_chunks is not None
+            ):
                 raise ValueError(
                     "sequential requests must not include request_id, "
-                    "chunk_id, or is_final_chunk."
+                    "chunk_id, or total_chunks."
                 )
 
-        return request_type, parent_request_id, chunk_id, is_final_chunk
+        return request_type, parent_request_id, chunk_id, total_chunks
 
     def process_inputs(
         self,
@@ -470,7 +478,7 @@ class InputProcessor:
             request_type,
             parent_request_id,
             chunk_id,
-            is_final_chunk,
+            total_chunks,
         ) = self._extract_request_metadata(prompt)
 
         # Optionally generate multimodal hash overrides to avoid hashing
@@ -588,7 +596,7 @@ class InputProcessor:
             request_type=request_type,
             parent_request_id=parent_request_id,
             chunk_id=chunk_id,
-            is_final_chunk=is_final_chunk,
+            total_chunks=total_chunks,
         )
 
     def _validate_model_inputs(

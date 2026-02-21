@@ -227,12 +227,11 @@ class EngineCore:
         self.parent_requests: dict[str, Request] = {}  # parent_req_id -> original Request
         self.chunk_lengths: dict[str, int] = {}  # chunk_req_id -> chunk token length
         self.chunk_to_parent: dict[str, str] = {}  # chunk_req_id -> parent_req_id
-        self.parents_waiting_for_final_chunk: set[str] = set()
         # Explicit concurrent mode bookkeeping: request_id -> {chunk_id: token_ids}
         self.concurrent_chunk_payloads: dict[str, dict[int, list[int]]] = {}
         self.concurrent_parent_template: dict[str, Request] = {}
         self.concurrent_parent_sampling_params: dict[str, Any] = {}
-        self.concurrent_final_chunk_received: set[str] = set()
+        self.concurrent_total_chunks: dict[str, int] = {}
 
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
@@ -335,11 +334,11 @@ class EngineCore:
             if (
                 request.parent_request_id is not None
                 or request.chunk_id is not None
-                or request.is_final_chunk
+                or request.total_chunks is not None
             ):
                 raise ValueError(
                     "sequential requests must not include request_id "
-                    "(parent_request_id), chunk_id, or is_final_chunk."
+                    "(parent_request_id), chunk_id, or total_chunks."
                 )
             self.scheduler.add_request(request)
             return
@@ -354,18 +353,42 @@ class EngineCore:
                 )
             if request.chunk_id is None:
                 raise ValueError("concurrent requests must provide chunk_id.")
+            if request.total_chunks is None:
+                raise ValueError("concurrent requests must provide total_chunks.")
             if request.prompt_token_ids is None:
                 raise ValueError(
                     "concurrent requests must provide prompt_token_ids."
                 )
+            if request.total_chunks <= 0:
+                raise ValueError("total_chunks must be greater than 0.")
 
             parent_id = request.parent_request_id
             chunk_payloads = self.concurrent_chunk_payloads.setdefault(parent_id, {})
+            if request.chunk_id in chunk_payloads:
+                raise ValueError(
+                    f"Duplicate chunk_id={request.chunk_id} for "
+                    f"parent_request_id={parent_id}."
+                )
             chunk_payloads[request.chunk_id] = list(request.prompt_token_ids)
             self.concurrent_parent_template.setdefault(parent_id, deepcopy(request))
             if request.sampling_params is not None:
                 self.concurrent_parent_sampling_params[parent_id] = deepcopy(
                     request.sampling_params
+                )
+            prev_total = self.concurrent_total_chunks.get(parent_id)
+            if prev_total is None:
+                self.concurrent_total_chunks[parent_id] = request.total_chunks
+            elif prev_total != request.total_chunks:
+                raise ValueError(
+                    f"Inconsistent total_chunks for parent_request_id={parent_id}: "
+                    f"got {request.total_chunks}, expected {prev_total}."
+                )
+            expected_total = self.concurrent_total_chunks[parent_id]
+            if len(chunk_payloads) > expected_total:
+                raise ValueError(
+                    f"Received {len(chunk_payloads)} unique chunks for "
+                    f"parent_request_id={parent_id}, exceeds total_chunks="
+                    f"{expected_total}."
                 )
 
             # Force each chunk request to prefill only.
@@ -394,26 +417,27 @@ class EngineCore:
             if request.request_id not in self.chunk_groups[parent_id]:
                 self.chunk_groups[parent_id].append(request.request_id)
             self.scheduler.register_sage_chunk(request.request_id, parent_id)
-
-            if request.is_final_chunk:
-                self.concurrent_final_chunk_received.add(parent_id)
-                self.parents_waiting_for_final_chunk.discard(parent_id)
+            if (
+                parent_id not in self.parent_requests
+                and len(chunk_payloads) == expected_total
+            ):
                 self.parent_requests[parent_id] = self._build_concurrent_parent_request(
                     parent_id
                 )
                 logger.info(
-                    "[SAGE_CONCURRENT] Received final chunk request %s for parent %s",
-                    request.request_id,
+                    "[SAGE_CONCURRENT] Received all chunk payloads for parent %s "
+                    "(total_chunks=%d)",
                     parent_id,
+                    expected_total,
                 )
 
             self.scheduler.add_request(request)
             logger.info(
-                "[SAGE_CONCURRENT] Added chunk request %s (chunk_id=%s, final=%s) "
+                "[SAGE_CONCURRENT] Added chunk request %s (chunk_id=%s, total_chunks=%s) "
                 "for parent %s",
                 request.request_id,
                 request.chunk_id,
-                request.is_final_chunk,
+                request.total_chunks,
                 parent_id,
             )
             return
@@ -762,7 +786,7 @@ class EngineCore:
             block_hasher=self.request_block_hasher,
             request_type="concurrent",
             parent_request_id=parent_id,
-            is_final_chunk=True,
+            total_chunks=self.concurrent_total_chunks.get(parent_id),
         )
         parent_request.sage_chunk_boundaries = chunk_boundaries
         return parent_request
@@ -789,24 +813,36 @@ class EngineCore:
                 # Mark chunk as complete
                 self.chunk_completion[parent_id].add(req_id)
 
-                # Check if all chunks are done
-                if self.chunk_completion[parent_id] == set(self.chunk_groups[parent_id]):
-                    if (
-                        parent_id in self.parent_requests
-                        and parent_id in self.concurrent_final_chunk_received
-                    ):
-                        parents_ready_for_blending.append(parent_id)
-                        logger.info(
-                            "All %d chunks complete for parent %s, ready for blending",
-                            len(self.chunk_groups[parent_id]), parent_id
+                expected_total = self.concurrent_total_chunks.get(parent_id)
+                if expected_total is None:
+                    logger.warning(
+                        "Missing total_chunks for parent %s while processing chunk %s",
+                        parent_id,
+                        req_id,
+                    )
+                    continue
+
+                completed_count = len(self.chunk_completion[parent_id])
+
+                if completed_count == expected_total:
+                    if parent_id not in self.parent_requests:
+                        self.parent_requests[parent_id] = (
+                            self._build_concurrent_parent_request(parent_id)
                         )
-                    else:
-                        # Hold until the final chunk for this parent is received.
-                        self.parents_waiting_for_final_chunk.add(parent_id)
-                        logger.info(
-                            "All %d chunks complete for parent %s, waiting for final chunk",
-                            len(self.chunk_groups[parent_id]), parent_id
-                        )
+                    parents_ready_for_blending.append(parent_id)
+                    logger.info(
+                        "Completed %d/%d chunks for parent %s, ready for blending",
+                        completed_count,
+                        expected_total,
+                        parent_id,
+                    )
+                elif completed_count > expected_total:
+                    logger.error(
+                        "Completed chunks (%d) exceeded total_chunks (%d) for parent %s",
+                        completed_count,
+                        expected_total,
+                        parent_id,
+                    )
 
         return parents_ready_for_blending
 
@@ -914,11 +950,10 @@ class EngineCore:
         chunk_ids = self.chunk_groups.get(parent_id, [])
         for chunk_id in chunk_ids:
             self.chunk_lengths.pop(chunk_id, None)
-        self.parents_waiting_for_final_chunk.discard(parent_id)
         self.concurrent_parent_template.pop(parent_id, None)
         self.concurrent_parent_sampling_params.pop(parent_id, None)
         self.concurrent_chunk_payloads.pop(parent_id, None)
-        self.concurrent_final_chunk_received.discard(parent_id)
+        self.concurrent_total_chunks.pop(parent_id, None)
         # Clean up parent tracking but NOT the chunk_to_parent mapping
         # as we need that to track which chunks belong to which parent
         self.chunk_groups.pop(parent_id, None)
@@ -938,11 +973,10 @@ class EngineCore:
         self.chunk_groups.pop(parent_id, None)
         self.chunk_completion.pop(parent_id, None)
         self.parent_requests.pop(parent_id, None)
-        self.parents_waiting_for_final_chunk.discard(parent_id)
         self.concurrent_parent_template.pop(parent_id, None)
         self.concurrent_parent_sampling_params.pop(parent_id, None)
         self.concurrent_chunk_payloads.pop(parent_id, None)
-        self.concurrent_final_chunk_received.discard(parent_id)
+        self.concurrent_total_chunks.pop(parent_id, None)
 
     # ==================== End Concurrent Prefill Methods ====================
 

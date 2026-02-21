@@ -109,15 +109,16 @@ class TokensPrompt(TypedDict):
 
     chunk_id: NotRequired[int]
     """
-    Optional chunk index for Sage concurrent chunk requests.
+    Optional chunk identifier for Sage concurrent chunk requests.
     Required when request_type="concurrent".
     Must be omitted when request_type="sequential".
+    Must be unique within a given request_id.
     """
 
-    is_final_chunk: NotRequired[bool]
+    total_chunks: NotRequired[int]
     """
-    Optional marker for Sage concurrent mode. True indicates the last chunk
-    submission for the logical request.
+    Total number of chunks for a Sage concurrent logical request.
+    Required when request_type="concurrent".
     Must be omitted when request_type="sequential".
     """
 
