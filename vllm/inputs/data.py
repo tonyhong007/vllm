@@ -115,6 +115,14 @@ class TokensPrompt(TypedDict):
     Must be unique within a given request_id.
     """
 
+    position: NotRequired[int]
+    """
+    Position of this chunk in the logical request.
+    Required when request_type="concurrent".
+    Must be omitted when request_type="sequential".
+    Must be in [0, total_chunks - 1] and unique within a given request_id.
+    """
+
     total_chunks: NotRequired[int]
     """
     Total number of chunks for a Sage concurrent logical request.

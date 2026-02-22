@@ -356,7 +356,7 @@ class LLM:
 
         self.request_counter = Counter()
         self.default_sampling_params: dict[str, Any] | None = None
-        self._concurrent_submitted_chunk_ids: dict[str, set[int]] = {}
+        self._concurrent_submitted_positions: dict[str, set[int]] = {}
         self._concurrent_expected_total_chunks: dict[str, int] = {}
 
         supported_tasks = self.llm_engine.get_supported_tasks()
@@ -450,7 +450,7 @@ class LLM:
         )
 
         # For incomplete concurrent submissions (fewer than total_chunks unique
-        # chunk_ids seen for each request_id), enqueue the request and kick a
+        # positions seen for each request_id), enqueue the request and kick a
         # single
         # engine step to start scheduling/prefill, but do not block for completion.
         if self._should_return_early_for_incomplete_concurrent_submission(prompts):
@@ -1731,6 +1731,7 @@ class LLM:
             request_type,
             request_id,
             chunk_id,
+            _position,
             _total_chunks,
         ) = self._extract_request_metadata(prompt)
 
@@ -1767,14 +1768,15 @@ class LLM:
 
     def _extract_request_metadata(
         self, prompt: PromptType
-    ) -> tuple[RequestType, str | None, int | None, int | None]:
+    ) -> tuple[RequestType, str | None, int | None, int | None, int | None]:
         request_type: RequestType = "sequential"
         request_id: str | None = None
         chunk_id: int | None = None
+        position: int | None = None
         total_chunks: int | None = None
 
         if not isinstance(prompt, dict):
-            return request_type, request_id, chunk_id, total_chunks
+            return request_type, request_id, chunk_id, position, total_chunks
 
         if "request_type" in prompt and prompt["request_type"] is not None:
             raw_request_type = str(prompt["request_type"]).lower()
@@ -1793,6 +1795,12 @@ class LLM:
                 raise TypeError("chunk_id must be an integer.")
             chunk_id = raw_chunk_id
 
+        if "position" in prompt and prompt["position"] is not None:
+            raw_position = prompt["position"]
+            if not isinstance(raw_position, int):
+                raise TypeError("position must be an integer.")
+            position = raw_position
+
         if "total_chunks" in prompt and prompt["total_chunks"] is not None:
             raw_total_chunks = prompt["total_chunks"]
             if not isinstance(raw_total_chunks, int):
@@ -1810,22 +1818,31 @@ class LLM:
                 raise ValueError(
                     "concurrent requests must provide chunk_id."
                 )
+            if position is None:
+                raise ValueError(
+                    "concurrent requests must provide position."
+                )
             if total_chunks is None:
                 raise ValueError(
                     "concurrent requests must provide total_chunks."
+                )
+            if position < 0 or position >= total_chunks:
+                raise ValueError(
+                    "position must be in the range [0, total_chunks)."
                 )
         else:
             if (
                 request_id is not None
                 or chunk_id is not None
+                or position is not None
                 or total_chunks is not None
             ):
                 raise ValueError(
                     "sequential requests must not include request_id, "
-                    "chunk_id, or total_chunks."
+                    "chunk_id, position, or total_chunks."
                 )
 
-        return request_type, request_id, chunk_id, total_chunks
+        return request_type, request_id, chunk_id, position, total_chunks
 
     def _should_return_early_for_incomplete_concurrent_submission(
         self, prompts: PromptType | Sequence[PromptType] | DataPrompt
@@ -1839,14 +1856,15 @@ class LLM:
 
         for prompt in prompts:
             has_prompt = True
-            request_type, request_id, chunk_id, total_chunks = self._extract_request_metadata(
-                prompt
+            request_type, request_id, chunk_id, position, total_chunks = (
+                self._extract_request_metadata(prompt)
             )
             if request_type != "concurrent":
                 return False
 
             assert request_id is not None
             assert chunk_id is not None and total_chunks is not None
+            assert position is not None
             touched_request_ids.add(request_id)
 
             expected_total = self._concurrent_expected_total_chunks.get(request_id)
@@ -1859,29 +1877,34 @@ class LLM:
                     f"{request_id}: got {total_chunks}, expected {expected_total}."
                 )
 
-            seen_chunk_ids = self._concurrent_submitted_chunk_ids.setdefault(
+            seen_positions = self._concurrent_submitted_positions.setdefault(
                 request_id, set()
             )
-            seen_chunk_ids.add(chunk_id)
-            assert len(seen_chunk_ids) <= expected_total, (
-                "Unique chunk_id count exceeded total_chunks for concurrent "
-                f"request_id={request_id}: got {len(seen_chunk_ids)} > "
+            if position in seen_positions:
+                raise ValueError(
+                    f"Duplicate position={position} for concurrent "
+                    f"request_id={request_id}."
+                )
+            seen_positions.add(position)
+            assert len(seen_positions) <= expected_total, (
+                "Unique position count exceeded total_chunks for concurrent "
+                f"request_id={request_id}: got {len(seen_positions)} > "
                 f"{expected_total}."
             )
-            if len(seen_chunk_ids) >= expected_total:
+            if len(seen_positions) >= expected_total:
                 should_return_early = False
 
         # Reset local submission tracking once a request_id has reached its
-        # expected unique chunk count, so the same request_id can be reused.
+        # expected unique position count, so the same request_id can be reused.
         for request_id in touched_request_ids:
             expected_total = self._concurrent_expected_total_chunks.get(request_id)
-            seen_chunk_ids = self._concurrent_submitted_chunk_ids.get(request_id)
+            seen_positions = self._concurrent_submitted_positions.get(request_id)
             if (
                 expected_total is not None
-                and seen_chunk_ids is not None
-                and len(seen_chunk_ids) >= expected_total
+                and seen_positions is not None
+                and len(seen_positions) >= expected_total
             ):
-                self._concurrent_submitted_chunk_ids.pop(request_id, None)
+                self._concurrent_submitted_positions.pop(request_id, None)
                 self._concurrent_expected_total_chunks.pop(request_id, None)
 
         return has_prompt and should_return_early

@@ -78,6 +78,7 @@ class EngineCoreRequest(
     request_type: RequestType = "sequential"
     parent_request_id: str | None = None
     chunk_id: int | None = None
+    position: int | None = None
     total_chunks: int | None = None
 
     @property

@@ -229,6 +229,8 @@ class EngineCore:
         self.chunk_to_parent: dict[str, str] = {}  # chunk_req_id -> parent_req_id
         # Explicit concurrent mode bookkeeping: request_id -> {chunk_id: token_ids}
         self.concurrent_chunk_payloads: dict[str, dict[int, list[int]]] = {}
+        # request_id -> {position: chunk_id}
+        self.concurrent_chunk_positions: dict[str, dict[int, int]] = {}
         self.concurrent_parent_template: dict[str, Request] = {}
         self.concurrent_parent_sampling_params: dict[str, Any] = {}
         self.concurrent_total_chunks: dict[str, int] = {}
@@ -334,11 +336,12 @@ class EngineCore:
             if (
                 request.parent_request_id is not None
                 or request.chunk_id is not None
+                or request.position is not None
                 or request.total_chunks is not None
             ):
                 raise ValueError(
                     "sequential requests must not include request_id "
-                    "(parent_request_id), chunk_id, or total_chunks."
+                    "(parent_request_id), chunk_id, position, or total_chunks."
                 )
             self.scheduler.add_request(request)
             return
@@ -353,6 +356,8 @@ class EngineCore:
                 )
             if request.chunk_id is None:
                 raise ValueError("concurrent requests must provide chunk_id.")
+            if request.position is None:
+                raise ValueError("concurrent requests must provide position.")
             if request.total_chunks is None:
                 raise ValueError("concurrent requests must provide total_chunks.")
             if request.prompt_token_ids is None:
@@ -361,6 +366,10 @@ class EngineCore:
                 )
             if request.total_chunks <= 0:
                 raise ValueError("total_chunks must be greater than 0.")
+            if request.position < 0 or request.position >= request.total_chunks:
+                raise ValueError(
+                    "position must be in the range [0, total_chunks)."
+                )
 
             parent_id = request.parent_request_id
             chunk_payloads = self.concurrent_chunk_payloads.setdefault(parent_id, {})
@@ -370,6 +379,13 @@ class EngineCore:
                     f"parent_request_id={parent_id}."
                 )
             chunk_payloads[request.chunk_id] = list(request.prompt_token_ids)
+            chunk_positions = self.concurrent_chunk_positions.setdefault(parent_id, {})
+            if request.position in chunk_positions:
+                raise ValueError(
+                    f"Duplicate position={request.position} for "
+                    f"parent_request_id={parent_id}."
+                )
+            chunk_positions[request.position] = request.chunk_id
             self.concurrent_parent_template.setdefault(parent_id, deepcopy(request))
             if request.sampling_params is not None:
                 self.concurrent_parent_sampling_params[parent_id] = deepcopy(
@@ -390,6 +406,12 @@ class EngineCore:
                     f"parent_request_id={parent_id}, exceeds total_chunks="
                     f"{expected_total}."
                 )
+            if len(chunk_positions) > expected_total:
+                raise ValueError(
+                    f"Received {len(chunk_positions)} unique positions for "
+                    f"parent_request_id={parent_id}, exceeds total_chunks="
+                    f"{expected_total}."
+                )
 
             # Force each chunk request to prefill only.
             if request.sampling_params is not None:
@@ -402,10 +424,17 @@ class EngineCore:
             request.is_chunk_request = True
             if self.sage_skip_rope_adjustment:
                 position_offset = 0
-                for cid in sorted(chunk_payloads):
-                    if cid >= request.chunk_id:
-                        break
-                    position_offset += len(chunk_payloads[cid])
+                # Optimization mode requires chunk positions to be submitted
+                # in order so offsets can be computed exactly at ingest time.
+                for pos in range(request.position):
+                    if pos not in chunk_positions:
+                        raise ValueError(
+                            "When SAGE_SKIP_ROPE_ADJUSTMENT=True, concurrent chunks "
+                            "must be submitted in increasing position order "
+                            "without gaps."
+                        )
+                    prev_chunk_id = chunk_positions[pos]
+                    position_offset += len(chunk_payloads[prev_chunk_id])
                 request.sage_position_offset = position_offset
             else:
                 request.sage_position_offset = 0
@@ -433,10 +462,12 @@ class EngineCore:
 
             self.scheduler.add_request(request)
             logger.info(
-                "[SAGE_CONCURRENT] Added chunk request %s (chunk_id=%s, total_chunks=%s) "
+                "[SAGE_CONCURRENT] Added chunk request %s "
+                "(chunk_id=%s, position=%s, total_chunks=%s) "
                 "for parent %s",
                 request.request_id,
                 request.chunk_id,
+                request.position,
                 request.total_chunks,
                 parent_id,
             )
@@ -747,9 +778,36 @@ class EngineCore:
         chunk_payloads = self.concurrent_chunk_payloads.get(parent_id, {})
         if not chunk_payloads:
             raise ValueError(f"No chunk payloads found for request_id={parent_id}")
+        chunk_positions = self.concurrent_chunk_positions.get(parent_id, {})
+        if len(chunk_positions) != len(chunk_payloads):
+            raise ValueError(
+                "Mismatch between chunk positions and payloads for "
+                f"request_id={parent_id}: positions={len(chunk_positions)} "
+                f"payloads={len(chunk_payloads)}."
+            )
+        expected_total = self.concurrent_total_chunks.get(parent_id)
+        if expected_total is None:
+            raise ValueError(f"Missing total_chunks for request_id={parent_id}")
+        if len(chunk_positions) != expected_total:
+            raise ValueError(
+                f"Incomplete chunk positions for request_id={parent_id}: "
+                f"positions={len(chunk_positions)} expected={expected_total}."
+            )
+        expected_positions = set(range(expected_total))
+        actual_positions = set(chunk_positions)
+        if actual_positions != expected_positions:
+            raise ValueError(
+                f"Invalid chunk positions for request_id={parent_id}: "
+                f"got={sorted(actual_positions)} expected={sorted(expected_positions)}."
+            )
 
         template_request = self.concurrent_parent_template[parent_id]
-        ordered_chunk_ids = sorted(chunk_payloads)
+        ordered_chunk_ids = [chunk_positions[pos] for pos in range(expected_total)]
+        logger.info(
+            "[SAGE_CONCURRENT] Assembling parent %s in position order %s",
+            parent_id,
+            ordered_chunk_ids,
+        )
         full_tokens: list[int] = []
         chunk_boundaries: list[int] = []
         position = 0
@@ -953,6 +1011,7 @@ class EngineCore:
         self.concurrent_parent_template.pop(parent_id, None)
         self.concurrent_parent_sampling_params.pop(parent_id, None)
         self.concurrent_chunk_payloads.pop(parent_id, None)
+        self.concurrent_chunk_positions.pop(parent_id, None)
         self.concurrent_total_chunks.pop(parent_id, None)
         # Clean up parent tracking but NOT the chunk_to_parent mapping
         # as we need that to track which chunks belong to which parent
@@ -976,6 +1035,7 @@ class EngineCore:
         self.concurrent_parent_template.pop(parent_id, None)
         self.concurrent_parent_sampling_params.pop(parent_id, None)
         self.concurrent_chunk_payloads.pop(parent_id, None)
+        self.concurrent_chunk_positions.pop(parent_id, None)
         self.concurrent_total_chunks.pop(parent_id, None)
 
     # ==================== End Concurrent Prefill Methods ====================

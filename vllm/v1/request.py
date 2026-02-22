@@ -48,6 +48,7 @@ class Request:
         request_type: RequestType = "sequential",
         parent_request_id: str | None = None,
         chunk_id: int | None = None,
+        position: int | None = None,
         total_chunks: int | None = None,
     ) -> None:
         self.request_id = request_id
@@ -123,6 +124,7 @@ class Request:
         self.request_type: RequestType = request_type
         self.parent_request_id = parent_request_id
         self.chunk_id = chunk_id
+        self.position = position
         self.total_chunks = total_chunks
         # State
         # The number of tokens with prefix cache hits.
@@ -184,6 +186,7 @@ class Request:
             request_type=request.request_type,
             parent_request_id=request.parent_request_id,
             chunk_id=request.chunk_id,
+            position=request.position,
             total_chunks=request.total_chunks,
         )
 
