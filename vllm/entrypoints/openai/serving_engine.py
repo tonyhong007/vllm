@@ -1220,7 +1220,47 @@ class OpenAIServing:
         if hasattr(request, "cache_salt") and request.cache_salt is not None:
             engine_prompt["cache_salt"] = request.cache_salt
 
+        # Forward Sage concurrent metadata from OpenAI extra body to engine
+        # prompt so downstream input parsing can validate and route correctly.
+        engine_prompt.update(self._extract_sage_prompt_metadata(request))
+
         return conversation, [engine_prompt]
+
+    @staticmethod
+    def _extract_sage_prompt_metadata(
+        request: ChatLikeRequest | ResponsesRequest,
+    ) -> dict[str, Any]:
+        model_extra = getattr(request, "model_extra", None) or {}
+        if not isinstance(model_extra, dict):
+            return {}
+
+        raw_request_type = model_extra.get("request_type")
+        if raw_request_type is None:
+            return {}
+
+        request_type = str(raw_request_type).lower()
+        metadata: dict[str, Any] = {"request_type": request_type}
+
+        if request_type == "concurrent":
+            required_fields = ("request_id", "chunk_id", "position", "total_chunks")
+            missing_fields = [
+                key for key in required_fields
+                if key not in model_extra or model_extra[key] is None
+            ]
+            if missing_fields:
+                missing = ", ".join(missing_fields)
+                raise ValueError(
+                    "concurrent Sage requests must include the following fields "
+                    f"in extra_body: request_id, chunk_id, position, total_chunks. "
+                    f"Missing: {missing}."
+                )
+
+            metadata["request_id"] = str(model_extra["request_id"])
+            metadata["chunk_id"] = model_extra["chunk_id"]
+            metadata["position"] = model_extra["position"]
+            metadata["total_chunks"] = model_extra["total_chunks"]
+
+        return metadata
 
     async def _process_inputs(
         self,
