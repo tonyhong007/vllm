@@ -1625,20 +1625,19 @@ class Scheduler(SchedulerInterface):
         for manager_idx, manager in enumerate(coordinator.single_type_managers):
             if all_ordered_blocks_by_manager[manager_idx]:
                 manager.req_to_blocks[parent_id] = all_ordered_blocks_by_manager[manager_idx]
-                # Count blocks already cached (have block_hash set) to prevent
-                # cache_full_blocks from re-caching them and hitting
-                # assert blk.block_hash is None
-                num_already_cached = sum(
-                    1 for blk in all_ordered_blocks_by_manager[manager_idx]
+                num_transferred_blocks = len(all_ordered_blocks_by_manager[manager_idx])
+                manager.num_cached_block[parent_id] = num_transferred_blocks
+                num_already_hashed = sum(
+                    1
+                    for blk in all_ordered_blocks_by_manager[manager_idx]
                     if blk.block_hash is not None
                 )
-                if num_already_cached > 0:
-                    manager.num_cached_block[parent_id] = num_already_cached
-                    logger.info(
-                        f"[SAGE_ZERO_COPY]   Manager {manager_idx}: "
-                        f"{num_already_cached} blocks already cached, "
-                        f"set num_cached_block to skip re-caching"
-                    )
+                logger.info(
+                    f"[SAGE_ZERO_COPY]   Manager {manager_idx}: "
+                    f"{num_already_hashed} blocks already hashed, "
+                    f"set num_cached_block={num_transferred_blocks} "
+                    f"to skip re-caching transferred blocks"
+                )
                 logger.info(
                     f"[SAGE_ZERO_COPY]   Assigned {len(all_ordered_blocks_by_manager[manager_idx])} "
                     f"blocks to parent in manager {manager_idx}"

@@ -1242,20 +1242,32 @@ class OpenAIServing:
         metadata: dict[str, Any] = {"request_type": request_type}
 
         if request_type == "concurrent":
-            required_fields = ("request_id", "chunk_id", "position", "total_chunks")
+            parent_request_id = (
+                model_extra.get("sage_request_id")
+                if model_extra.get("sage_request_id") is not None
+                else model_extra.get("parent_request_id")
+            )
+            if parent_request_id is None:
+                # Backward compatibility for older non-chat payload formats.
+                parent_request_id = model_extra.get("request_id")
+
+            required_fields = ("chunk_id", "position", "total_chunks")
             missing_fields = [
                 key for key in required_fields
                 if key not in model_extra or model_extra[key] is None
             ]
+            if parent_request_id is None:
+                missing_fields.insert(0, "sage_request_id")
             if missing_fields:
                 missing = ", ".join(missing_fields)
                 raise ValueError(
                     "concurrent Sage requests must include the following fields "
-                    f"in extra_body: request_id, chunk_id, position, total_chunks. "
+                    "in extra_body: sage_request_id, chunk_id, position, "
+                    "total_chunks. "
                     f"Missing: {missing}."
                 )
 
-            metadata["request_id"] = str(model_extra["request_id"])
+            metadata["request_id"] = str(parent_request_id)
             metadata["chunk_id"] = model_extra["chunk_id"]
             metadata["position"] = model_extra["position"]
             metadata["total_chunks"] = model_extra["total_chunks"]

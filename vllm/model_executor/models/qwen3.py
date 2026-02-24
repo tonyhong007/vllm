@@ -211,11 +211,17 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Import timing manager lazily to avoid circular imports
-        from vllm.utils.layer_timing import LayerTimingManager
-        timing_manager = LayerTimingManager.get_instance()
-        
-        if timing_manager.is_enabled:
+        # Skip timing manager when torch.compile is tracing this function.
+        # LayerTimingManager singleton initialization mutates class attributes,
+        # which TorchDynamo cannot currently trace.
+        is_compiling = torch.compiler.is_compiling()
+        if not is_compiling:
+            from vllm.utils.layer_timing import LayerTimingManager
+            timing_manager = LayerTimingManager.get_instance()
+        else:
+            timing_manager = None
+
+        if timing_manager is not None and timing_manager.is_enabled:
             # Total layer timing
             total_start = torch.cuda.Event(enable_timing=True)
             total_end = torch.cuda.Event(enable_timing=True)
