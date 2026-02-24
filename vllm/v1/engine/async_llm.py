@@ -130,6 +130,10 @@ class AsyncLLM(EngineClient):
             tracer = init_tracer("vllm.llm_engine", endpoint)
             self.output_processor.tracer = tracer
 
+        # Concurrent Sage ingestion path:
+        # register a parent output stream once per parent request id.
+        self.concurrent_parent_output_registered: set[str] = set()
+
         # EngineCore (starts the engine in background process).
         self.engine_core = EngineCoreClient.make_async_mp_client(
             vllm_config=vllm_config,
@@ -315,6 +319,31 @@ class AsyncLLM(EngineClient):
 
         # Use cloned params that may have been updated in process_inputs()
         params = request.params
+
+        # Concurrent Sage ingestion path:
+        # - One request queue (the first concurrent request for a parent id)
+        #   is bound to the parent final output stream.
+        # - Other chunk requests keep their own lightweight chunk outputs.
+        if request.request_type == "concurrent":
+            parent_request_id = request.parent_request_id
+            if parent_request_id is None:
+                raise ValueError(
+                    "concurrent requests must provide request_id "
+                    "(propagated as parent_request_id)."
+                )
+
+            if parent_request_id not in self.concurrent_parent_output_registered:
+                parent_output_request = copy(request)
+                parent_output_request.request_id = parent_request_id
+                self.output_processor.add_request(
+                    parent_output_request, prompt_text, None, 0, queue
+                )
+                self.concurrent_parent_output_registered.add(parent_request_id)
+            else:
+                self.output_processor.add_request(request, prompt_text, None, 0, queue)
+
+            await self.engine_core.add_request_async(request)
+            return queue
 
         if is_pooling or params.n == 1:
             await self._add_request(request, prompt_text, None, 0, queue)
@@ -523,6 +552,11 @@ class AsyncLLM(EngineClient):
                         )
 
                     output_processor.update_scheduler_stats(outputs.scheduler_stats)
+                    if outputs.finished_requests is not None:
+                        for finished_request_id in outputs.finished_requests:
+                            self.concurrent_parent_output_registered.discard(
+                                finished_request_id
+                            )
 
                     # 4) Logging.
                     # TODO(rob): make into a coroutine and launch it in
