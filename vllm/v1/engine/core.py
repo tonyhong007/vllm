@@ -234,6 +234,7 @@ class EngineCore:
         self.concurrent_parent_template: dict[str, Request] = {}
         self.concurrent_parent_sampling_params: dict[str, Any] = {}
         self.concurrent_total_chunks: dict[str, int] = {}
+        self.concurrent_parent_query_token_count: dict[str, int] = {}
 
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
@@ -391,6 +392,20 @@ class EngineCore:
                 self.concurrent_parent_sampling_params[parent_id] = deepcopy(
                     request.sampling_params
                 )
+            if request.sage_query_token_count is not None:
+                prev_query_count = self.concurrent_parent_query_token_count.get(parent_id)
+                if (
+                    prev_query_count is not None
+                    and prev_query_count != request.sage_query_token_count
+                ):
+                    raise ValueError(
+                        "Inconsistent sage_query_token_count for "
+                        f"parent_request_id={parent_id}: got "
+                        f"{request.sage_query_token_count}, expected {prev_query_count}."
+                    )
+                self.concurrent_parent_query_token_count[parent_id] = int(
+                    request.sage_query_token_count
+                )
             prev_total = self.concurrent_total_chunks.get(parent_id)
             if prev_total is None:
                 self.concurrent_total_chunks[parent_id] = request.total_chunks
@@ -416,6 +431,9 @@ class EngineCore:
             # Force each chunk request to prefill only.
             if request.sampling_params is not None:
                 request.sampling_params = deepcopy(request.sampling_params)
+                # Chunk requests are ingestion-only; never inherit user-level
+                # min_tokens (e.g. 50) or they will keep decoding extra tokens.
+                request.sampling_params.min_tokens = 0
                 request.sampling_params.max_tokens = 1
                 # Scheduler logic uses request.max_tokens (captured at request
                 # construction), so update it as well to prevent chunk decode.
@@ -845,6 +863,9 @@ class EngineCore:
             request_type="concurrent",
             parent_request_id=parent_id,
             total_chunks=self.concurrent_total_chunks.get(parent_id),
+            sage_query_token_count=self.concurrent_parent_query_token_count.get(
+                parent_id
+            ),
         )
         parent_request.sage_chunk_boundaries = chunk_boundaries
         return parent_request
@@ -1013,6 +1034,7 @@ class EngineCore:
         self.concurrent_chunk_payloads.pop(parent_id, None)
         self.concurrent_chunk_positions.pop(parent_id, None)
         self.concurrent_total_chunks.pop(parent_id, None)
+        self.concurrent_parent_query_token_count.pop(parent_id, None)
         # Clean up parent tracking but NOT the chunk_to_parent mapping
         # as we need that to track which chunks belong to which parent
         self.chunk_groups.pop(parent_id, None)
@@ -1037,6 +1059,7 @@ class EngineCore:
         self.concurrent_chunk_payloads.pop(parent_id, None)
         self.concurrent_chunk_positions.pop(parent_id, None)
         self.concurrent_total_chunks.pop(parent_id, None)
+        self.concurrent_parent_query_token_count.pop(parent_id, None)
 
     # ==================== End Concurrent Prefill Methods ====================
 

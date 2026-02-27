@@ -80,6 +80,9 @@ class EngineCoreRequest(
     chunk_id: int | None = None
     position: int | None = None
     total_chunks: int | None = None
+    # Number of trailing prompt tokens that correspond to the user query.
+    # Used by Prophet-style Stage-I scoring in SAGE incremental blending.
+    sage_query_token_count: int | None = None
 
     @property
     def params(self) -> SamplingParams | PoolingParams:

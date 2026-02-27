@@ -450,11 +450,8 @@ class LLM:
         )
 
         # For incomplete concurrent submissions (fewer than total_chunks unique
-        # positions seen for each request_id), enqueue the request and kick a
-        # single
-        # engine step to start scheduling/prefill, but do not block for completion.
+        # positions seen for each request_id), enqueue the request and return immediately
         if self._should_return_early_for_incomplete_concurrent_submission(prompts):
-            self.llm_engine.step()
             return []
 
         outputs = self._run_engine(use_tqdm=use_tqdm)

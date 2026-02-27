@@ -391,15 +391,30 @@ class InputProcessor:
 
     def _extract_request_metadata(
         self, prompt: PromptType
-    ) -> tuple[RequestType, str | None, int | None, int | None, int | None]:
+    ) -> tuple[
+        RequestType,
+        str | None,
+        int | None,
+        int | None,
+        int | None,
+        int | None,
+    ]:
         request_type: RequestType = "sequential"
         parent_request_id: str | None = None
         chunk_id: int | None = None
         position: int | None = None
         total_chunks: int | None = None
+        sage_query_token_count: int | None = None
 
         if not isinstance(prompt, dict):
-            return request_type, parent_request_id, chunk_id, position, total_chunks
+            return (
+                request_type,
+                parent_request_id,
+                chunk_id,
+                position,
+                total_chunks,
+                sage_query_token_count,
+            )
 
         if "request_type" in prompt and prompt["request_type"] is not None:
             raw_request_type = str(prompt["request_type"]).lower()
@@ -432,6 +447,17 @@ class InputProcessor:
                 raise ValueError("total_chunks must be greater than 0.")
             total_chunks = raw_total_chunks
 
+        if (
+            "sage_query_token_count" in prompt
+            and prompt["sage_query_token_count"] is not None
+        ):
+            raw_query_token_count = prompt["sage_query_token_count"]
+            if not isinstance(raw_query_token_count, int):
+                raise TypeError("sage_query_token_count must be an integer.")
+            if raw_query_token_count <= 0:
+                raise ValueError("sage_query_token_count must be greater than 0.")
+            sage_query_token_count = raw_query_token_count
+
         if request_type == "concurrent":
             if parent_request_id is None:
                 raise ValueError(
@@ -459,7 +485,14 @@ class InputProcessor:
                     "chunk_id, position, or total_chunks."
                 )
 
-        return request_type, parent_request_id, chunk_id, position, total_chunks
+        return (
+            request_type,
+            parent_request_id,
+            chunk_id,
+            position,
+            total_chunks,
+            sage_query_token_count,
+        )
 
     def process_inputs(
         self,
@@ -494,6 +527,7 @@ class InputProcessor:
             chunk_id,
             position,
             total_chunks,
+            sage_query_token_count,
         ) = self._extract_request_metadata(prompt)
 
         # Optionally generate multimodal hash overrides to avoid hashing
@@ -613,6 +647,7 @@ class InputProcessor:
             chunk_id=chunk_id,
             position=position,
             total_chunks=total_chunks,
+            sage_query_token_count=sage_query_token_count,
         )
 
     def _validate_model_inputs(

@@ -50,6 +50,7 @@ class Request:
         chunk_id: int | None = None,
         position: int | None = None,
         total_chunks: int | None = None,
+        sage_query_token_count: int | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -126,6 +127,7 @@ class Request:
         self.chunk_id = chunk_id
         self.position = position
         self.total_chunks = total_chunks
+        self.sage_query_token_count = sage_query_token_count
         # State
         # The number of tokens with prefix cache hits.
         self.num_cached_tokens = -1
@@ -188,6 +190,7 @@ class Request:
             chunk_id=request.chunk_id,
             position=request.position,
             total_chunks=request.total_chunks,
+            sage_query_token_count=request.sage_query_token_count,
         )
 
     def append_output_token_ids(
