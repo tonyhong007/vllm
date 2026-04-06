@@ -217,8 +217,8 @@ class Scheduler(SchedulerInterface):
         # Sage concurrent prefill: track chunk requests and their blocks
         # chunk_id -> parent_id mapping
         self.sage_chunk_to_parent: dict[str, str] = {}
-        # parent_id -> list of (chunk_id, blocks, num_tokens) tuples
-        self.sage_parent_chunk_blocks: dict[str, list[tuple[str, tuple[list[int], ...], int]]] = {}
+        # parent_id -> list of (chunk_id, blocks, num_tokens, chunk_position) tuples
+        self.sage_parent_chunk_blocks: dict[str, list[tuple[str, tuple[list[int], ...], int, int]]] = {}
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -1477,23 +1477,28 @@ class Scheduler(SchedulerInterface):
             parent_id = self.sage_chunk_to_parent[request_id]
             # Get block IDs before removing from tracking
             block_ids = self.kv_cache_manager.get_block_ids(request_id)
-            num_tokens = request.num_computed_tokens
+            # Preserve the full prompt-token span for each concurrent chunk.
+            # Using num_computed_tokens can undercount by one (or more) in
+            # decode-style scheduling and leads to incomplete parent zero-copy
+            # transfer, which corrupts pre-TTFT KV/remap behavior.
+            num_tokens = request.num_prompt_tokens
             num_blocks = len(block_ids[0]) if block_ids and len(block_ids) > 0 else 0
-            # Get position offset for GPU-direct copy
-            position_offset = getattr(request, 'sage_position_offset', 0)
-            
+            # Get ordinal chunk position (0, 1, 2, ...) for correct block ordering
+            chunk_position = getattr(request, 'position', None)
+            if chunk_position is None:
+                chunk_position = 0
+
             # Store the chunk's blocks for later transfer to parent
-            # Include position_offset for GPU-direct copy
             if parent_id not in self.sage_parent_chunk_blocks:
                 self.sage_parent_chunk_blocks[parent_id] = []
             self.sage_parent_chunk_blocks[parent_id].append(
-                (request_id, block_ids, num_tokens, position_offset)
+                (request_id, block_ids, num_tokens, chunk_position)
             )
-            
+
             logger.info(
                 f"[SAGE_PRESERVE] Chunk {request_id} finished: "
-                f"{num_tokens} tokens, {num_blocks} blocks, position_offset={position_offset} "
-                f"preserved for parent {parent_id}"
+                f"{num_tokens} tokens, {num_blocks} blocks, "
+                f"chunk_position={chunk_position} preserved for parent {parent_id}"
             )
             
             # Log block details for verification
@@ -1554,7 +1559,7 @@ class Scheduler(SchedulerInterface):
         chunk_block_info = self.sage_parent_chunk_blocks.pop(parent_id)
         total_blocks_freed = 0
 
-        for chunk_id, block_ids, num_tokens, position_offset in chunk_block_info:
+        for chunk_id, block_ids, num_tokens, chunk_position in chunk_block_info:
             # Free the blocks in the KV cache manager
             self.kv_cache_manager.coordinator.free(chunk_id)
             num_blocks = len(block_ids[0]) if block_ids and len(block_ids) > 0 else 0
@@ -1574,7 +1579,6 @@ class Scheduler(SchedulerInterface):
         """Transfer chunk blocks directly to parent - ZERO COPY optimization.
         
         This is the optimal approach for Sage concurrent prefill:
-        - Chunks have already computed KV with correct positional encoding (sage_position_offset)
         - We directly transfer block ownership from chunks to parent
         - No GPU-to-GPU copy needed at all!
         
@@ -1588,8 +1592,8 @@ class Scheduler(SchedulerInterface):
         if not chunk_block_info:
             return None
         
-        # Sort by position offset to ensure correct block ordering
-        chunk_block_info.sort(key=lambda x: x[3])  # x[3] is position_offset
+        # Sort by chunk ordinal position to ensure correct block ordering.
+        chunk_block_info.sort(key=lambda x: x[3])  # chunk_position
         
         coordinator = self.kv_cache_manager.coordinator
         total_tokens = 0
@@ -1600,10 +1604,10 @@ class Scheduler(SchedulerInterface):
         
         logger.info(f"[SAGE_ZERO_COPY] Starting zero-copy block transfer for parent {parent_id}")
         
-        for chunk_id, block_ids_raw, num_tokens, position_offset in chunk_block_info:
+        for chunk_id, block_ids_raw, num_tokens, chunk_position in chunk_block_info:
             logger.info(
                 f"[SAGE_ZERO_COPY]   Chunk {chunk_id}: {num_tokens} tokens, "
-                f"position_offset={position_offset}"
+                f"chunk_position={chunk_position}"
             )
             
             # Transfer blocks from each manager
@@ -1652,6 +1656,63 @@ class Scheduler(SchedulerInterface):
         )
         
         return total_tokens, total_blocks, all_ordered_blocks_by_manager
+
+    def allocate_sage_receive_blocks(
+        self,
+        parent_id: str,
+        chunk_req_id: str,
+        num_blocks: int,
+        num_tokens: int,
+        position: int,
+    ) -> list[int]:
+        """Pre-allocate empty blocks on the home GPU to receive KV from a
+        remote GPU via NCCL.
+
+        Allocates blocks from the free pool, stores them under chunk_req_id
+        in req_to_blocks so transfer_sage_blocks_to_parent_zero_copy can
+        assemble them into the parent later.
+
+        Returns the physical block IDs for the NCCL receive destination.
+        """
+        coordinator = self.kv_cache_manager.coordinator
+        dest_block_ids: list[int] = []
+
+        for manager in coordinator.single_type_managers:
+            if num_blocks > manager.block_pool.get_num_free_blocks():
+                raise RuntimeError(
+                    f"Cannot allocate {num_blocks} receive blocks for "
+                    f"chunk {chunk_req_id} (parent {parent_id}): "
+                    f"only {manager.block_pool.get_num_free_blocks()} free"
+                )
+            blocks = manager.block_pool.get_new_blocks(num_blocks)
+            manager.req_to_blocks[chunk_req_id] = blocks
+            # Collect physical block IDs from the first manager.
+            if not dest_block_ids:
+                dest_block_ids = [int(blk.block_id) for blk in blocks]
+
+        # Register in sage_parent_chunk_blocks for later assembly.
+        # Same tuple format as _finish_request:
+        # (chunk_id, block_ids_as_int_tuples, num_tokens, chunk_position)
+        block_ids_as_ints = tuple(
+            [int(blk.block_id) for blk in manager.req_to_blocks[chunk_req_id]]
+            for manager in coordinator.single_type_managers
+        )
+        self.sage_parent_chunk_blocks.setdefault(parent_id, []).append(
+            (chunk_req_id, block_ids_as_ints, num_tokens, position)
+        )
+        # Also register the chunk-to-parent mapping so assembly can clean up.
+        self.sage_chunk_to_parent[chunk_req_id] = parent_id
+
+        logger.info(
+            "[SAGE_PARALLEL] Allocated %d receive blocks for chunk %s "
+            "(parent %s, pos=%d): block_ids=%s...",
+            num_blocks,
+            chunk_req_id,
+            parent_id,
+            position,
+            dest_block_ids[:5],
+        )
+        return dest_block_ids
 
     # ==================== End Sage Concurrent Prefill Methods ====================
 

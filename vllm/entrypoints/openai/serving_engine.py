@@ -1251,7 +1251,10 @@ class OpenAIServing:
                 # Backward compatibility for older non-chat payload formats.
                 parent_request_id = model_extra.get("request_id")
 
-            required_fields = ("chunk_id", "position", "total_chunks")
+            required_fields = (
+                "chunk_id", "position", "total_chunks",
+                "query_token_count",
+            )
             missing_fields = [
                 key for key in required_fields
                 if key not in model_extra or model_extra[key] is None
@@ -1263,7 +1266,7 @@ class OpenAIServing:
                 raise ValueError(
                     "concurrent Sage requests must include the following fields "
                     "in extra_body: sage_request_id, chunk_id, position, "
-                    "total_chunks. "
+                    "total_chunks, query_token_count. "
                     f"Missing: {missing}."
                 )
 
@@ -1271,6 +1274,15 @@ class OpenAIServing:
             metadata["chunk_id"] = model_extra["chunk_id"]
             metadata["position"] = model_extra["position"]
             metadata["total_chunks"] = model_extra["total_chunks"]
+            metadata["query_token_count"] = int(
+                model_extra["query_token_count"]
+            )
+
+            # Optional: multi-GPU parallel prefill fields.
+            if model_extra.get("home_kv_address") is not None:
+                metadata["home_kv_address"] = str(
+                    model_extra["home_kv_address"]
+                )
 
         return metadata
 

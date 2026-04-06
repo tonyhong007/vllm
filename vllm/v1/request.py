@@ -50,7 +50,8 @@ class Request:
         chunk_id: int | None = None,
         position: int | None = None,
         total_chunks: int | None = None,
-        sage_query_token_count: int | None = None,
+        query_token_count: int = 0,
+        home_kv_address: str | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -127,7 +128,7 @@ class Request:
         self.chunk_id = chunk_id
         self.position = position
         self.total_chunks = total_chunks
-        self.sage_query_token_count = sage_query_token_count
+        self.home_kv_address = home_kv_address
         # State
         # The number of tokens with prefix cache hits.
         self.num_cached_tokens = -1
@@ -152,7 +153,6 @@ class Request:
 
         # Concurrent prefill fields
         self.is_chunk_request: bool = False  # True for chunk prefill requests
-        self.sage_position_offset: int = 0  # Position offset for chunks (used for RoPE)
         # For parent requests: chunk info for GPU-direct copy
         # List of (chunk_id, position_offset, num_tokens, block_ids) tuples
         # block_ids is a list of integers (physical block indices)
@@ -163,6 +163,9 @@ class Request:
         # Chunk boundary positions for GPU-direct blending (e.g., [0, 2770, 4615, ...])
         # Used to tell the blender which positions need recomputation
         self.sage_chunk_boundaries: list[int] | None = None
+        # Number of query/suffix tokens in the last chunk that should always
+        # be recomputed during blending (excluded from diff_k selection).
+        self.query_token_count: int = query_token_count
 
     @classmethod
     def from_engine_core_request(
@@ -190,7 +193,8 @@ class Request:
             chunk_id=request.chunk_id,
             position=request.position,
             total_chunks=request.total_chunks,
-            sage_query_token_count=request.sage_query_token_count,
+            query_token_count=request.query_token_count or 0,
+            home_kv_address=request.home_kv_address,
         )
 
     def append_output_token_ids(

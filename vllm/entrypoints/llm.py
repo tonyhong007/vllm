@@ -457,6 +457,32 @@ class LLM:
         outputs = self._run_engine(use_tqdm=use_tqdm)
         return self.engine_class.validate_outputs(outputs, RequestOutput)
 
+    def wait_for_request(
+        self,
+        request_id: str,
+        timeout: float = 300,
+    ) -> "RequestOutput":
+        """Block until a request produces finished output.
+
+        Used by SAGE parallel prefill: the home GPU submits local chunks
+        via generate(), then calls wait_for_request(parent_id) to block
+        until the parent request (created internally after all remote KV
+        arrives) finishes generating.
+
+        The engine loop keeps running (stepping, polling for remote KV,
+        assembling parent, blending, decoding) while this method blocks.
+        """
+        import time as _time
+        deadline = _time.monotonic() + timeout
+        while _time.monotonic() < deadline:
+            step_outputs = self.llm_engine.step()
+            for output in step_outputs:
+                if output.request_id == request_id and output.finished:
+                    return output
+        raise TimeoutError(
+            f"wait_for_request({request_id!r}) timed out after {timeout}s"
+        )
+
     def _get_modality_specific_lora_reqs(
         self,
         prompts: PromptType | Sequence[PromptType],

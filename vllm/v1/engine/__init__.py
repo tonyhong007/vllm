@@ -80,9 +80,12 @@ class EngineCoreRequest(
     chunk_id: int | None = None
     position: int | None = None
     total_chunks: int | None = None
-    # Number of trailing prompt tokens that correspond to the user query.
-    # Used by Prophet-style Stage-I scoring in SAGE incremental blending.
-    sage_query_token_count: int | None = None
+    # SAGE: number of query/suffix tokens in the last chunk that should
+    # always be recomputed during blending (excluded from diff_k selection).
+    query_token_count: int | None = None
+    # SAGE parallel prefill: P2pNcclEngine ZMQ address of the home GPU.
+    # Workers use this to send KV after chunk prefill completes.
+    home_kv_address: str | None = None
 
     @property
     def params(self) -> SamplingParams | PoolingParams:

@@ -139,10 +139,6 @@ class InputBatch:
         )
         self.num_computed_tokens_cpu = self.num_computed_tokens_cpu_tensor.numpy()
 
-        # Sage concurrent prefill: position offset for each request
-        # This is added to positions during prefill so chunks have correct RoPE
-        self.sage_position_offset_cpu = np.zeros(max_num_reqs, dtype=np.int32)
-
         # Block table.
         self.block_table = MultiGroupBlockTable(
             max_num_reqs=max_num_reqs,
@@ -351,8 +347,6 @@ class InputBatch:
         self.num_tokens_no_spec[req_index] = request.num_tokens
 
         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
-        # Sage concurrent prefill: set position offset for chunks
-        self.sage_position_offset_cpu[req_index] = getattr(request, 'sage_position_offset', 0)
         self.block_table.add_row(request.block_ids, req_index)
 
         if sampling_params := request.sampling_params:
@@ -544,12 +538,6 @@ class InputBatch:
             self.num_computed_tokens_cpu[i2],
             self.num_computed_tokens_cpu[i1],
         )
-        # Swap sage_position_offset_cpu
-        self.sage_position_offset_cpu[i1], self.sage_position_offset_cpu[i2] = (
-            self.sage_position_offset_cpu[i2],
-            self.sage_position_offset_cpu[i1],
-        )
-
         # NOTE: the following is unsafe
         # self.token_ids_cpu[i1, ...], self.token_ids_cpu[i2, ...], =\
         #     self.token_ids_cpu[i2, ...], self.token_ids_cpu[i1, ...]
@@ -699,10 +687,6 @@ class InputBatch:
             ]
             self.num_prompt_tokens[empty_index] = self.num_prompt_tokens[last_req_index]
             self.num_computed_tokens_cpu[empty_index] = self.num_computed_tokens_cpu[
-                last_req_index
-            ]
-            # Move sage_position_offset_cpu
-            self.sage_position_offset_cpu[empty_index] = self.sage_position_offset_cpu[
                 last_req_index
             ]
             self.block_table.move_row(last_req_index, empty_index)

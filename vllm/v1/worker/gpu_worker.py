@@ -176,6 +176,36 @@ class Worker(WorkerBase):
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
+    def get_kv_caches(self) -> list[torch.Tensor]:
+        """Return kv_caches for SAGE cross-GPU KV transfer."""
+        return self.model_runner.get_kv_caches()
+
+    def get_attention_layer_names(self) -> list[str]:
+        """Return attention layer names from static_forward_context."""
+        ctx = self.vllm_config.compilation_config.static_forward_context
+        return [
+            name for name, layer in ctx.items()
+            if hasattr(layer, "kv_cache")
+        ]
+
+    def sage_pre_connect_to_home(self, home_address: str) -> None:
+        """Pre-connect worker's P2pNcclEngine to home GPU."""
+        connector = get_kv_transfer_group()
+        connector.p2p_nccl_engine.create_connect(home_address)
+
+    def sage_send_chunk_header(
+        self, transfer_id: str, token_ids: list[int], dest_address: str,
+    ) -> None:
+        """Send token_ids header to home GPU via worker's P2pNcclEngine."""
+        connector = get_kv_transfer_group()
+        header = torch.tensor(
+            [len(token_ids)] + token_ids,
+            dtype=torch.long, device=self.device_config.device,
+        )
+        connector.p2p_nccl_engine.send_tensor(
+            f"{transfer_id}#header", header, dest_address,
+        )
+
     def init_device(self):
         device = self.device_config.device
         if isinstance(device, torch.device) and device.type == "cuda":

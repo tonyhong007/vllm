@@ -201,6 +201,19 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         # Fallback for older versions that don't support this method
         return set()
 
+    def cache_prompt_embeddings(self, *args: Any, **kwargs: Any) -> None:
+        """Cache prompt embeddings for multimodal fused injection."""
+        if hasattr(self._lmcache_engine, "cache_prompt_embeddings"):
+            self._lmcache_engine.cache_prompt_embeddings(*args, **kwargs)
+
+    def inject_fused_recompute_tokens(self, *args: Any, **kwargs: Any) -> Any:
+        """
+        Delegate fused decode+recompute token injection to the inner engine.
+        Called from gpu_model_runner inside the forward context, before
+        _model_forward, to inject M recompute tokens for SAGE.
+        """
+        return self._lmcache_engine.inject_fused_recompute_tokens(*args, **kwargs)
+
     def get_kv_connector_kv_cache_events(self) -> LMCacheKVEvents | None:
         """
         Get the KV connector kv cache events collected during the last interval.

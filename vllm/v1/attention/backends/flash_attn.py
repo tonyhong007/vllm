@@ -34,6 +34,7 @@ if is_flash_attn_varlen_func_available():
 from vllm.config import VllmConfig, get_current_vllm_config, get_layers_from_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.distributed.parallel_state import get_dcp_group
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.batch_invariant import (
     vllm_is_batch_invariant,
@@ -684,11 +685,65 @@ class FlashAttentionImpl(AttentionImpl):
                 )
                 return output
             else:
+                # Check for SAGE late injection: replay tokens already in query
+                # (concatenated in model forward), no separate replay_ctx needed.
+                _sage_M = getattr(attn_metadata, 'sage_fused_replay_count', 0) or 0
+                if _sage_M > 0:
+                    # Late injection: query has [replay(M), decode(1)].
+                    # Split and run 2-sequence attention.
+                    replay_query_len = _sage_M
+                    decode_query_len = int(num_actual_tokens) - replay_query_len
+
+                    # 2 sequences: replay (M) + decode (1).
+                    fused_query = query[:num_actual_tokens]
+                    fused_output = output[:num_actual_tokens]
+                    fused_cu_seqlens_q = torch.tensor(
+                        [0, replay_query_len, num_actual_tokens],
+                        dtype=cu_seqlens_q.dtype,
+                        device=cu_seqlens_q.device,
+                    )
+                    fused_seqused_k = seqused_k[:1].expand(2).contiguous()
+                    fused_max_seqlen_q = max(replay_query_len, decode_query_len)
+                    fused_max_seqlen_k = int(max_seqlen_k)
+                    if block_table.ndim != 2 or int(block_table.shape[0]) < 1:
+                        raise RuntimeError(
+                            "SAGE late injection requires 2D block_table "
+                            f"with at least one row, got shape={tuple(block_table.shape)}."
+                        )
+                    fused_block_table = block_table[:1].expand(2, -1).contiguous()
+                    fused_descale_shape = (2, self.num_kv_heads)
+                    flash_attn_varlen_func(
+                        q=fused_query,
+                        k=key_cache,
+                        v=value_cache,
+                        out=fused_output,
+                        cu_seqlens_q=fused_cu_seqlens_q,
+                        max_seqlen_q=fused_max_seqlen_q,
+                        seqused_k=fused_seqused_k,
+                        max_seqlen_k=fused_max_seqlen_k,
+                        softmax_scale=self.scale,
+                        causal=True,
+                        alibi_slopes=self.alibi_slopes,
+                        window_size=self.sliding_window,
+                        block_table=fused_block_table,
+                        softcap=self.logits_soft_cap,
+                        scheduler_metadata=None,
+                        fa_version=self.vllm_flash_attn_version,
+                        q_descale=layer._q_scale.expand(fused_descale_shape),
+                        k_descale=layer._k_scale.expand(fused_descale_shape),
+                        v_descale=layer._v_scale.expand(fused_descale_shape),
+                        num_splits=attn_metadata.max_num_splits,
+                        s_aux=self.sinks,
+                    )
+                    return output
+
+                decode_query = query[:num_actual_tokens]
+                decode_output = output[:num_actual_tokens]
                 flash_attn_varlen_func(
-                    q=query[:num_actual_tokens],
+                    q=decode_query,
                     k=key_cache,
                     v=value_cache,
-                    out=output[:num_actual_tokens],
+                    out=decode_output,
                     cu_seqlens_q=cu_seqlens_q,
                     max_seqlen_q=max_seqlen_q,
                     seqused_k=seqused_k,

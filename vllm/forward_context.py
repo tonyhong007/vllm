@@ -205,6 +205,11 @@ class ForwardContext:
 
     ubatch_slices: UBatchSlices | None = None
 
+    # SAGE layerwise extraction: the extract post-hook saves M replay
+    # tokens' boundary hidden_states/residual here after the target layers.
+    # Read by the adapter in wait_for_save to update boundary state.
+    sage_extract_result: dict | None = None
+
     def __post_init__(self):
         assert self.cudagraph_runtime_mode.valid_runtime_modes(), (
             f"Invalid cudagraph runtime mode: {self.cudagraph_runtime_mode}"

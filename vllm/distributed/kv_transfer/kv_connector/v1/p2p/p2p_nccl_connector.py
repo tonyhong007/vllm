@@ -39,16 +39,21 @@ class ReqMeta:
     block_ids: torch.Tensor
     # Request num tokens
     num_tokens: int
+    # Explicit destination address (SAGE per-layer transfer).
+    # When set, save_kv_layer uses this instead of parsing from request_id.
+    dest_address: str | None = None
 
     @staticmethod
     def make_meta(
-        request_id: str, token_ids: list[int], block_ids: list[int], block_size: int
+        request_id: str, token_ids: list[int], block_ids: list[int],
+        block_size: int, dest_address: str | None = None,
     ) -> "ReqMeta":
         block_ids_tensor = torch.tensor(block_ids)
         return ReqMeta(
             request_id=request_id,
             block_ids=block_ids_tensor,
             num_tokens=len(token_ids),
+            dest_address=dest_address,
         )
 
 
@@ -65,9 +70,11 @@ class P2pNcclConnectorMetadata(KVConnectorMetadata):
         token_ids: list[int],
         block_ids: list[int],
         block_size: int,
+        dest_address: str | None = None,
     ) -> None:
         self.requests.append(
-            ReqMeta.make_meta(request_id, token_ids, block_ids, block_size)
+            ReqMeta.make_meta(request_id, token_ids, block_ids, block_size,
+                              dest_address=dest_address)
         )
 
 
@@ -298,8 +305,11 @@ class P2pNcclConnector(KVConnectorBase_V1):
         assert isinstance(connector_metadata, P2pNcclConnectorMetadata)
         for request in connector_metadata.requests:
             request_id = request.request_id
-            ip, port = self.parse_request_id(request_id, True)
-            remote_address = ip + ":" + str(port + self._rank)
+            if request.dest_address is not None:
+                remote_address = request.dest_address
+            else:
+                ip, port = self.parse_request_id(request_id, True)
+                remote_address = ip + ":" + str(port + self._rank)
 
             kv_cache = extract_kv_from_layer(kv_layer, request.block_ids)
             self.p2p_nccl_engine.send_tensor(

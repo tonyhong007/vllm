@@ -163,6 +163,8 @@ class P2pNcclEngine:
 
         # tensor_id: torch.Tensor/(addr, dtype, shape)
         self.recv_store: dict[str, Any] = {}
+        # Optional callback for SAGE parallel prefill (after each recv).
+        self._on_recv_callback: Any = None
         self.recv_request_id_to_tensor_ids: dict[str, set[str]] = {}
         self.send_request_id_to_tensor_ids: dict[str, set[str]] = {}
         self.socks: dict[str, Any] = {}  # remote_address: client socket
@@ -309,13 +311,23 @@ class P2pNcclEngine:
         self,
         tensor_id: str,
         remote_address: str | None = None,
+        timeout: float | None = None,
     ) -> torch.Tensor:
         if self.send_type == "PUT" or self.send_type == "PUT_ASYNC":
             start_time = time.time()
             with self.recv_store_cv:
                 while tensor_id not in self.recv_store:
-                    self.recv_store_cv.wait()
-                tensor = self.recv_store[tensor_id]
+                    if timeout is not None:
+                        remaining = timeout - (time.time() - start_time)
+                        if remaining <= 0:
+                            raise TimeoutError(
+                                f"recv_tensor({tensor_id!r}) timed out "
+                                f"after {timeout}s"
+                            )
+                        self.recv_store_cv.wait(timeout=remaining)
+                    else:
+                        self.recv_store_cv.wait()
+                tensor = self.recv_store.pop(tensor_id)
 
             if tensor is not None:
                 if isinstance(tensor, tuple):
@@ -432,6 +444,9 @@ class P2pNcclEngine:
                     self.recv_store[tensor_id] = tensor
                     self.have_received_tensor_id(tensor_id)
                     self.recv_store_cv.notify()
+                # Optional callback for SAGE parallel prefill.
+                if self._on_recv_callback is not None:
+                    self._on_recv_callback(tensor_id)
 
             elif data["cmd"] == "GET":
                 tensor_id = data["tensor_id"]

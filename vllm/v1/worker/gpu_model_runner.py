@@ -609,6 +609,10 @@ class GPUModelRunner(
         self.kv_connector_output: KVConnectorOutput | None = None
         self.layerwise_nvtx_hooks_registered = False
 
+    def get_kv_caches(self) -> list[torch.Tensor]:
+        """Return kv_caches for SAGE cross-GPU KV transfer."""
+        return self.kv_caches
+
     def reset_mm_cache(self) -> None:
         if self.mm_budget:
             self.mm_budget.reset_cache()
@@ -1325,34 +1329,13 @@ class GPUModelRunner(
         # arange: [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         cu_num_tokens, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
 
-        # Get positions.
-        # For Sage concurrent prefill, add sage_position_offset so chunks have correct RoPE
+        # Get positions for slot_mapping, token_indices, and RoPE.
         positions_np = self.positions.np[:total_num_scheduled_tokens]
         np.add(
             self.input_batch.num_computed_tokens_cpu[req_indices],
             arange,
             out=positions_np,
         )
-        # Add Sage position offset for concurrent prefill chunks
-        sage_offsets = self.input_batch.sage_position_offset_cpu[req_indices]
-        if np.any(sage_offsets != 0):
-            # Log the sage offset application for debugging
-            unique_req_indices = np.unique(req_indices)
-            for req_idx in unique_req_indices:
-                offset = self.input_batch.sage_position_offset_cpu[req_idx]
-                if offset != 0:
-                    mask = req_indices == req_idx
-                    pos_before = positions_np[mask].copy()
-                    logger.info(
-                        f"[SAGE_OFFSET] Request idx={req_idx}: applying sage_position_offset={offset}, "
-                        f"positions before=[{pos_before[0]}..{pos_before[-1]}], "
-                        f"positions after=[{pos_before[0] + offset}..{pos_before[-1] + offset}]"
-                    )
-            np.add(positions_np, sage_offsets, out=positions_np)
-            logger.info(
-                f"[SAGE_OFFSET] Applied sage offsets to {len(sage_offsets)} tokens. "
-                f"Final position range: [{positions_np[0]}..{positions_np[-1]}]"
-            )
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -1364,7 +1347,7 @@ class GPUModelRunner(
         if self.uses_xdrope_dim > 0:
             self._calc_xdrope_positions(scheduler_output)
 
-        # Get token indices.
+        # Get token indices using LOCAL positions (before sage offset).
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
         # where M is the max_model_len.
@@ -2548,6 +2531,14 @@ class GPUModelRunner(
         else:
             positions = self.positions.gpu[:num_input_tokens]
 
+        # Cache embeddings + positions for SAGE multimodal fused injection.
+        if inputs_embeds is not None and has_kv_transfer_group():
+            _sage_kv = get_kv_transfer_group()
+            if hasattr(_sage_kv, "cache_prompt_embeddings"):
+                _sage_kv.cache_prompt_embeddings(
+                    scheduler_output, inputs_embeds, positions,
+                )
+
         if is_first_rank:
             intermediate_tensors = None
         else:
@@ -3106,41 +3097,37 @@ class GPUModelRunner(
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
-            sage_enable_timing = os.getenv("SAGE_ENABLE_TIMING", "0").lower() == "1"
-            if sage_enable_timing:
-                # Time the forward pass (after blending which happens in kv_connector context)
-                forward_start_event = torch.cuda.Event(enable_timing=True)
-                forward_end_event = torch.cuda.Event(enable_timing=True)
-                forward_start_event.record()
-                forward_wall_start = time.perf_counter()
+            # start_load_kv already ran inside maybe_get_kv_connector_output before yield.
+            # Inject M recompute tokens before the decode token for each fused request.
+            # Only safe when not using CUDA graphs (batch size change invalidates graphs).
+            if has_kv_transfer_group():
+                _kv = get_kv_transfer_group()
+                if hasattr(_kv, "inject_fused_recompute_tokens"):
+                    assert cudagraph_mode == CUDAGraphMode.NONE, (
+                        "SAGE fused injection is incompatible with CUDA graphs "
+                        "(batch size changes). Use enforce_eager=True."
+                    )
+                    result = _kv.inject_fused_recompute_tokens(
+                        model_runner=self,
+                        input_ids=input_ids,
+                        positions=positions,
+                        logits_indices=logits_indices,
+                        attn_metadata=attn_metadata,
+                        num_reqs=num_reqs,
+                        inputs_embeds=inputs_embeds,
+                    )
+                    if len(result) == 4:
+                        input_ids, positions, logits_indices, inputs_embeds = result
+                    else:
+                        input_ids, positions, logits_indices = result
 
-                model_output = self._model_forward(
-                    input_ids=input_ids,
-                    positions=positions,
-                    intermediate_tensors=intermediate_tensors,
-                    inputs_embeds=inputs_embeds,
-                    **model_kwargs,
-                )
-
-                forward_end_event.record()
-                torch.cuda.synchronize()
-                forward_wall_time = time.perf_counter() - forward_wall_start
-                forward_gpu_time = forward_start_event.elapsed_time(forward_end_event)
-                logger.info(
-                    "[FORWARD_TIMING] _model_forward() wall_time=%.3fms, gpu_time=%.3fms "
-                    "for %d tokens",
-                    forward_wall_time * 1000,
-                    forward_gpu_time,
-                    num_tokens_padded,
-                )
-            else:
-                model_output = self._model_forward(
-                    input_ids=input_ids,
-                    positions=positions,
-                    intermediate_tensors=intermediate_tensors,
-                    inputs_embeds=inputs_embeds,
-                    **model_kwargs,
-                )
+            model_output = self._model_forward(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                **model_kwargs,
+            )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
