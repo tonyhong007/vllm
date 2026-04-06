@@ -128,11 +128,17 @@ class SageKVTransferEngine:
         dest_address: str,
         transfer_id: str,
         image_grid_thw: list[list[int]] | None = None,
+        total_chunks: int = 0,
+        max_tokens: int = 1,
+        min_tokens: int = 0,
+        query_token_count: int = 0,
     ) -> None:
         """Send a chunk's metadata + bulk KV to a peer.
 
         Protocol (2 NCCL sends):
-          1. metadata: [num_blocks, num_images, mm_t0,h0,w0,..., tok_0, tok_1, ...]
+          1. metadata: [num_blocks, num_images, total_chunks, max_tokens,
+                        min_tokens, query_token_count,
+                        mm_t0,h0,w0,..., tok_0, tok_1, ...]
           2. bulk_kv: all layers concatenated
         """
         if self._kv_caches is None:
@@ -140,9 +146,11 @@ class SageKVTransferEngine:
         block_ids_t = torch.tensor(
             block_ids, dtype=torch.long, device=self.device
         )
-        # Build merged metadata: [num_blocks, num_images, <mm_flat>, <token_ids>]
         num_images = len(image_grid_thw) if image_grid_thw else 0
-        meta_list: list[int] = [len(block_ids), num_images]
+        meta_list: list[int] = [
+            len(block_ids), num_images, total_chunks,
+            max_tokens, min_tokens, query_token_count,
+        ]
         if image_grid_thw:
             for thw in image_grid_thw:
                 meta_list.extend(thw)
@@ -175,11 +183,13 @@ class SageKVTransferEngine:
         transfer_id: str,
         allocate_blocks_fn: "Callable[[int], list[int]]",
         timeout: float = 300.0,
-    ) -> tuple[list[int], list[int], int, int, list[list[int]]]:
+    ) -> dict:
         """Receive a chunk's metadata + bulk KV.
 
-        Returns:
-            (token_ids, dest_block_ids, num_tokens, num_blocks, image_grid_thw)
+        Returns dict with keys:
+            token_ids, dest_block_ids, num_tokens, num_blocks,
+            image_grid_thw, total_chunks, max_tokens, min_tokens,
+            query_token_count
         """
         if self._kv_caches is None:
             raise RuntimeError("KV caches not set — call set_kv_caches first")
@@ -189,11 +199,15 @@ class SageKVTransferEngine:
         meta_cpu = metadata.cpu().tolist()
         num_blocks = int(meta_cpu[0])
         num_images = int(meta_cpu[1])
-        # Parse mm metadata: 3 ints per image after [num_blocks, num_images]
+        total_chunks = int(meta_cpu[2])
+        max_tokens = int(meta_cpu[3])
+        min_tokens = int(meta_cpu[4])
+        query_token_count = int(meta_cpu[5])
+        # Parse mm metadata: 3 ints per image after the 6-int header
         image_grid_thw: list[list[int]] = []
-        mm_end = 2
+        mm_end = 6
         for i in range(num_images):
-            offset = 2 + i * 3
+            offset = 6 + i * 3
             image_grid_thw.append(
                 [int(meta_cpu[offset]), int(meta_cpu[offset + 1]),
                  int(meta_cpu[offset + 2])]
@@ -221,7 +235,17 @@ class SageKVTransferEngine:
             num_tokens, num_blocks, self._num_layers,
             num_images, transfer_id,
         )
-        return token_ids, dest_block_ids, num_tokens, num_blocks, image_grid_thw
+        return {
+            "token_ids": token_ids,
+            "dest_block_ids": dest_block_ids,
+            "num_tokens": num_tokens,
+            "num_blocks": num_blocks,
+            "image_grid_thw": image_grid_thw,
+            "total_chunks": total_chunks,
+            "max_tokens": max_tokens,
+            "min_tokens": min_tokens,
+            "query_token_count": query_token_count,
+        }
 
     def recv_chunk_per_layer(
         self,

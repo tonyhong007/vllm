@@ -1241,12 +1241,21 @@ class EngineCore:
             len(image_grid_thw),
             home_addr,
         )
+        # Get generation params from parent template for home registration.
+        template = self.concurrent_parent_template.get(parent_id)
+        sp = self.concurrent_parent_sampling_params.get(parent_id)
         self._sage_kv_transfer.send_chunk(
             block_ids=block_ids,
             token_ids=token_ids,
             dest_address=home_addr,
             transfer_id=transfer_id,
             image_grid_thw=image_grid_thw,
+            total_chunks=self.concurrent_total_chunks.get(parent_id, 0),
+            max_tokens=sp.max_tokens if sp else 1,
+            min_tokens=sp.min_tokens if sp else 0,
+            query_token_count=self._concurrent_query_token_count.get(
+                parent_id, 0
+            ),
         )
         self.scheduler.free_sage_chunk_blocks(parent_id)
 
@@ -1348,12 +1357,55 @@ class EngineCore:
                 )
             )
         else:
-            token_ids, dest_block_ids, num_tokens, num_blocks, image_grid_thw = (
-                self._sage_kv_transfer.recv_chunk(
-                    transfer_id=transfer_id,
-                    allocate_blocks_fn=_allocate,
-                )
+            result = self._sage_kv_transfer.recv_chunk(
+                transfer_id=transfer_id,
+                allocate_blocks_fn=_allocate,
             )
+            token_ids = result["token_ids"]
+            dest_block_ids = result["dest_block_ids"]
+            num_tokens = result["num_tokens"]
+            num_blocks = result["num_blocks"]
+            image_grid_thw = result["image_grid_thw"]
+
+            # Auto-register parent if home has no local chunks (3-GPU mode).
+            # The first remote chunk carries enough metadata to set up
+            # the parent tracking that normally happens when a local
+            # chunk is submitted via _handle_concurrent_request.
+            if parent_id not in self.concurrent_total_chunks:
+                total = result["total_chunks"]
+                if total > 0:
+                    self.concurrent_total_chunks[parent_id] = total
+                    self.chunk_completion.setdefault(parent_id, set())
+                    self.chunk_groups.setdefault(parent_id, [])
+                    self._concurrent_query_token_count[parent_id] = (
+                        result["query_token_count"]
+                    )
+                    from vllm.sampling_params import SamplingParams
+                    sp = SamplingParams(
+                        temperature=0.0,
+                        max_tokens=result["max_tokens"],
+                        min_tokens=result["min_tokens"],
+                    )
+                    self.concurrent_parent_sampling_params[parent_id] = sp
+                    # Create a minimal template Request for parent assembly.
+                    from vllm.v1.request import Request
+                    template = Request(
+                        request_id=parent_id,
+                        prompt_token_ids=token_ids,
+                        sampling_params=sp,
+                        eos_token_id=self.scheduler.eos_token_id,
+                        arrival_time=_time.perf_counter(),
+                        lora_request=None,
+                        request_type="concurrent",
+                        parent_request_id=parent_id,
+                        total_chunks=total,
+                    )
+                    self.concurrent_parent_template[parent_id] = template
+                    logger.info(
+                        "[SAGE_PARALLEL] Auto-registered parent %s from "
+                        "remote chunk (total_chunks=%d, max_tokens=%d)",
+                        parent_id, total, result["max_tokens"],
+                    )
 
         # Update num_tokens in sage_parent_chunk_blocks.
         for i, entry in enumerate(
@@ -1373,7 +1425,6 @@ class EngineCore:
 
         remote = self._sage_remote_chunks_received.setdefault(parent_id, {})
         remote[chunk_req_id] = (position, dest_block_ids, num_tokens)
-        # Store image_grid_thw for multimodal parent assembly.
         if image_grid_thw:
             remote_mm = self._sage_remote_image_grid_thw.setdefault(parent_id, {})
             remote_mm[chunk_req_id] = image_grid_thw
@@ -1386,18 +1437,44 @@ class EngineCore:
         self._maybe_launch_parent(parent_id)
 
     def _process_remote_chunk_arrivals(self) -> None:
-        """Home GPU: check if any remote chunks have headers in recv_store.
+        """Home GPU: check if any remote chunks have data in recv_store.
 
-        For each parent we know about, compute remote positions
-        (total - local), and for any not yet started, check if
-        the header tensor is already in P2pNcclEngine's recv_store.
-        If so, process the full recv (header is already there so
-        recv_tensor returns immediately, then KV layers follow).
+        For each parent we know about, check all remote positions.
+        Also scan recv_store for unregistered parents (3-GPU mode
+        where home has no local chunks).
         """
         if self._sage_kv_transfer is None:
             return
         nccl_engine = self._sage_kv_transfer._nccl_engine
         num_layers = self._sage_kv_transfer._num_layers
+
+        # Discover unregistered parents from recv_store keys (3-GPU mode
+        # where home has no local chunks). Scan for ready chunks from
+        # unknown parents and process one per call to trigger auto-registration.
+        unregistered_ready = None
+        with nccl_engine.recv_store_cv:
+            for key in nccl_engine.recv_store:
+                if not key.endswith("#metadata"):
+                    continue
+                # key = "sage_{parent_id}_pos_{N}#metadata"
+                prefix = key[: -len("#metadata")]  # "sage_{pid}_pos_{N}"
+                parts = prefix.rsplit("_pos_", 1)
+                if len(parts) != 2:
+                    continue
+                pid = parts[0][len("sage_"):]  # extract parent_id
+                pos = int(parts[1])
+                if pid in self.concurrent_total_chunks:
+                    continue  # already registered
+                bulk_key = f"{prefix}#bulk_kv"
+                if bulk_key in nccl_engine.recv_store:
+                    unregistered_ready = (pid, pos)
+                    break
+        if unregistered_ready is not None:
+            pid, pos = unregistered_ready
+            started = self._sage_recv_started.setdefault(pid, set())
+            if pos not in started:
+                started.add(pos)
+                self._receive_remote_chunk(pid, pos)
 
         for parent_id, total in list(self.concurrent_total_chunks.items()):
             local_pos = self._sage_local_positions.get(parent_id, set())
