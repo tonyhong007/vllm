@@ -1527,6 +1527,26 @@ class Scheduler(SchedulerInterface):
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
+        if getattr(request, "sage_blocks_transferred", False):
+            coordinator = self.kv_cache_manager.coordinator
+            for manager in coordinator.single_type_managers:
+                blocks = manager.req_to_blocks.get(request.request_id)
+                if blocks is not None:
+                    seen: set[int] = set()
+                    unique: list = []
+                    for blk in blocks:
+                        bid = id(blk)
+                        if bid not in seen:
+                            seen.add(bid)
+                            unique.append(blk)
+                    if len(unique) < len(blocks):
+                        logger.info(
+                            "[SAGE_FREE_DEDUP] %s: %d → %d blocks "
+                            "(removed %d shared prefix duplicates)",
+                            request.request_id, len(blocks),
+                            len(unique), len(blocks) - len(unique),
+                        )
+                    manager.req_to_blocks[request.request_id] = unique
         self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
 
