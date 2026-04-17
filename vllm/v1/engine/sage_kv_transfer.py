@@ -89,10 +89,12 @@ class SageKVTransferEngine:
         if self._num_layers > 0:
             first = kv_caches[0]
             self._is_flash_attn = first.dim() >= 3 and first.shape[0] == 2
+        _layout = "flash [2,blocks,bsz,H,D]" if self._is_flash_attn else "triton/other [blocks,2,bsz,H,D]"
         logger.info(
-            "[SAGE_KV_TRANSFER] KV caches set: %d layers, flash_attn=%s",
+            "[SAGE_KV_TRANSFER] KV caches set: %d layers, layout=%s shape=%s",
             self._num_layers,
-            self._is_flash_attn,
+            _layout,
+            tuple(kv_caches[0].shape) if self._num_layers > 0 else "N/A",
         )
 
     def set_layer_names(self, layer_names: list[str]) -> None:
@@ -105,7 +107,7 @@ class SageKVTransferEngine:
 
     def _inject_kv(
         self, layer: torch.Tensor, kv_data: torch.Tensor,
-        block_ids: torch.Tensor
+        block_ids: torch.Tensor,
     ) -> None:
         """Inject KV into a single layer's paged cache."""
         if self._is_flash_attn:
@@ -120,6 +122,27 @@ class SageKVTransferEngine:
         if self._is_flash_attn:
             return layer[:, block_ids, ...].contiguous()
         return layer[block_ids, ...].contiguous()
+
+    def send_layer(
+        self,
+        layer_idx: int,
+        layer_name: str,
+        block_ids: torch.Tensor,
+        dest_address: str,
+        transfer_id: str,
+    ) -> None:
+        """Send a single layer's KV for a chunk to the home GPU.
+
+        Called from the per-layer send callback during model forward.
+        The tensor_id format matches recv_chunk_per_layer_payload's
+        recv_tensor call: f"{transfer_id}#{layer_name}".
+        """
+        if self._kv_caches is None:
+            raise RuntimeError("KV caches not set")
+        kv_data = self._extract_kv(self._kv_caches[layer_idx], block_ids)
+        self._nccl_engine.send_tensor(
+            f"{transfer_id}#{layer_name}", kv_data, dest_address,
+        )
 
     def send_chunk(
         self,
@@ -247,59 +270,107 @@ class SageKVTransferEngine:
             "query_token_count": query_token_count,
         }
 
+    def recv_chunk_per_layer_header(self, transfer_id: str) -> dict:
+        """Receive only the per-layer chunk's metadata header.
+
+        Header layout (must match EngineCore early header send):
+            [num_tokens, num_blocks, total_chunks, max_tokens, min_tokens,
+             query_token_count, tok_0, tok_1, ...]
+        """
+        if not hasattr(self, "_layer_names") or not self._layer_names:
+            raise RuntimeError("Layer names not set — call set_layer_names")
+        header = self._nccl_engine.recv_tensor(f"{transfer_id}#header")
+        header_cpu = header.cpu().tolist()
+        return {
+            "num_tokens": int(header_cpu[0]),
+            "num_blocks": int(header_cpu[1]),
+            "total_chunks": int(header_cpu[2]),
+            "max_tokens": int(header_cpu[3]),
+            "min_tokens": int(header_cpu[4]),
+            "query_token_count": int(header_cpu[5]),
+            "token_ids": [int(t) for t in header_cpu[6:]],
+        }
+
+    def recv_chunk_per_layer_payload(
+        self,
+        transfer_id: str,
+        dest_block_ids: list[int],
+        on_layer_done: "Callable[[int], None] | None" = None,
+    ) -> None:
+        """Receive all per-layer KV tensors for a chunk and inject them
+        into the pre-allocated destination blocks.
+
+        Runs from a background Python thread; uses the default CUDA
+        stream because the actual benefit on a single-node SAGE setup
+        comes from the early-header send + pipelined-blend trigger,
+        not from stream-level parallelism (which is bounded by
+        cross-process Hyper-Q on the GPU anyway).
+        """
+        if self._kv_caches is None:
+            raise RuntimeError("KV caches not set")
+        if not hasattr(self, "_layer_names") or not self._layer_names:
+            raise RuntimeError("Layer names not set — call set_layer_names")
+        dest_ids_t = torch.tensor(
+            dest_block_ids, dtype=torch.long, device=self.device
+        )
+        for layer_idx in range(self._num_layers):
+            layer_name = self._layer_names[layer_idx]
+            _tid = f"{transfer_id}#{layer_name}"
+            if layer_idx == 0:
+                logger.info(
+                    "[SAGE_KV_TRANSFER] Drain start %s (waiting for L0)",
+                    transfer_id,
+                )
+            try:
+                kv_data = self._nccl_engine.recv_tensor(
+                    _tid, timeout=30.0,
+                )
+            except TimeoutError:
+                logger.error(
+                    "[SAGE_KV_TRANSFER] TIMEOUT waiting for %s "
+                    "(layer %d/%d)", _tid, layer_idx, self._num_layers,
+                )
+                raise
+            self._inject_kv(
+                self._kv_caches[layer_idx], kv_data, dest_ids_t,
+            )
+            if on_layer_done is not None:
+                on_layer_done(layer_idx)
+        # Ensure all inject kernels have completed on the GPU before
+        # signaling "drain done".
+        torch.cuda.synchronize(self.device)
+        logger.info(
+            "[SAGE_KV_TRANSFER] Drained per-layer payload (%d layers, "
+            "%d blocks) [id=%s]",
+            self._num_layers, len(dest_block_ids), transfer_id,
+        )
+
     def recv_chunk_per_layer(
         self,
         transfer_id: str,
         allocate_blocks_fn: "Callable[[int], list[int]]",
-    ) -> tuple[list[int], list[int], int, int]:
-        """Receive a chunk whose KV was sent per-layer during forward.
+    ) -> dict:
+        """Synchronous per-layer recv: header → allocate → drain payload.
 
-        Header format: [num_tokens, tok_0, tok_1, ...]
-        Per-layer tensors: {transfer_id}#{layer_name} for each attention layer.
-
-        Returns:
-            (token_ids, dest_block_ids, num_tokens, num_blocks)
+        Kept for callers that want the legacy single-threaded path.
         """
         if self._kv_caches is None:
             raise RuntimeError("KV caches not set")
         if not hasattr(self, "_layer_names") or not self._layer_names:
             raise RuntimeError("Layer names not set — call set_layer_names")
 
-        # Receive header: [num_tokens, tok_0, tok_1, ...]
-        header = self._nccl_engine.recv_tensor(f"{transfer_id}#header")
-        header_cpu = header.cpu().tolist()
-        num_tokens = int(header_cpu[0])
-        token_ids = [int(t) for t in header_cpu[1:]]
-
-        # Compute num_blocks from the first per-layer tensor.
-        first_kv = self._nccl_engine.recv_tensor(
-            f"{transfer_id}#{self._layer_names[0]}"
-        )
-        if self._is_flash_attn:
-            num_blocks = first_kv.shape[1]
-        else:
-            num_blocks = first_kv.shape[0]
-
-        # Allocate destination blocks.
+        meta = self.recv_chunk_per_layer_header(transfer_id)
+        num_blocks = meta["num_blocks"]
         dest_block_ids = allocate_blocks_fn(num_blocks)
-        dest_ids_t = torch.tensor(
-            dest_block_ids, dtype=torch.long, device=self.device
-        )
-
-        # Inject first layer.
-        self._inject_kv(self._kv_caches[0], first_kv, dest_ids_t)
-
-        # Receive and inject remaining layers.
-        for layer_idx in range(1, self._num_layers):
-            layer_name = self._layer_names[layer_idx]
-            kv_data = self._nccl_engine.recv_tensor(
-                f"{transfer_id}#{layer_name}"
-            )
-            self._inject_kv(self._kv_caches[layer_idx], kv_data, dest_ids_t)
-
-        logger.info(
-            "[SAGE_KV_TRANSFER] Received chunk (%d tokens, %d blocks, "
-            "%d layers, per-layer) [id=%s]",
-            num_tokens, num_blocks, self._num_layers, transfer_id,
-        )
-        return token_ids, dest_block_ids, num_tokens, num_blocks
+        self.recv_chunk_per_layer_payload(transfer_id, dest_block_ids)
+        return {
+            "token_ids": meta["token_ids"],
+            "dest_block_ids": dest_block_ids,
+            "num_tokens": meta["num_tokens"],
+            "num_blocks": num_blocks,
+            "image_grid_thw": [],
+            "total_chunks": meta["total_chunks"],
+            "max_tokens": meta["max_tokens"],
+            "min_tokens": meta["min_tokens"],
+            "query_token_count": meta["query_token_count"],
+        }

@@ -137,9 +137,9 @@ class EngineCore:
         self._sage_home_rank = int(
             os.environ.get("SAGE_HOME_GPU", "0")
         ) if self.sage_parallel_prefill else 0
-        # Per-layer transfer: sends KV during forward via P2pNcclConnector.
-        # Only useful for multi-node with slow interconnect (>10 Gbps).
-        # Default: bulk transfer after forward (lower overhead intra-node).
+        # Per-layer transfer: sends KV layer-by-layer via SageKVTransferEngine
+        # callback during forward, enabling pipelined early-blend on the home.
+        # Default: bulk transfer after forward.
         self._sage_per_layer_transfer = (
             self.sage_parallel_prefill
             and os.environ.get("SAGE_PER_LAYER_TRANSFER", "").lower()
@@ -155,8 +155,8 @@ class EngineCore:
                 )
             is_home = self._sage_instance_rank == self._sage_home_rank
             if self._sage_per_layer_transfer:
-                # Per-layer mode: home gets SageKVTransferEngine,
-                # worker sends per-layer via P2pNcclConnector.
+                # Per-layer mode: both home and worker get SageKVTransferEngine.
+                # Worker sends per-layer via save_kv_layer callback.
                 if is_home:
                     from vllm.v1.engine.sage_kv_transfer import (
                         SageKVTransferEngine,
@@ -190,14 +190,43 @@ class EngineCore:
                             self._sage_attention_layer_names
                         )
                 else:
-                    home_address = os.environ.get("SAGE_HOME_KV_ADDRESS")
-                    if not home_address:
-                        raise RuntimeError(
-                            "SAGE_PER_LAYER_TRANSFER requires "
-                            "SAGE_HOME_KV_ADDRESS env var"
-                        )
+                    # Worker: create SageKVTransferEngine for per-layer
+                    # NCCL send (replaces P2pNcclConnector approach).
+                    from vllm.v1.engine.sage_kv_transfer import (
+                        SageKVTransferEngine,
+                    )
+                    dp_size = vllm_config.parallel_config.data_parallel_size
+                    dp_rank = self._sage_instance_rank
+                    local_gpu = (
+                        vllm_config.parallel_config.data_parallel_rank_local
+                        or 0
+                    )
+                    self._sage_kv_transfer = SageKVTransferEngine(
+                        dp_rank=dp_rank,
+                        dp_size=dp_size,
+                        local_gpu_id=local_gpu,
+                        kv_transfer_config=kv_config,
+                    )
+                    kv_cache_refs = self.collective_rpc("get_kv_caches")
+                    if kv_cache_refs and kv_cache_refs[0]:
+                        self._sage_kv_transfer.set_kv_caches(kv_cache_refs[0])
+                    names = self.collective_rpc("get_attention_layer_names")
+                    if names and names[0]:
+                        self._sage_attention_layer_names = names[0]
+                        self._sage_kv_transfer.set_layer_names(names[0])
+                        # Build name→index lookup for the callback.
+                        self._sage_layer_name_to_idx = {
+                            n: i for i, n in enumerate(names[0])
+                        }
+                    # Pending per-layer sends for the current step.
+                    # Populated before each forward, consumed by the
+                    # save_kv_layer callback during forward.
+                    self._sage_kv_transfer._pending_sends = []
+                    # Register per-layer send callback on the connector.
                     self.collective_rpc(
-                        "sage_pre_connect_to_home", args=(home_address,)
+                        "sage_register_per_layer_callback",
+                        args=(self._sage_kv_transfer,
+                              self._sage_layer_name_to_idx),
                     )
             else:
                 # Bulk mode (default): SageKVTransferEngine on all instances.
@@ -222,6 +251,19 @@ class EngineCore:
                         lambda tid: _input_q.put_nowait(
                             ("_SAGE_REMOTE_KV",)
                         ) if "#bulk_kv" in tid else None
+                    )
+
+            # Pre-warm the LMCache blender on the home GPU. Saves ~50 ms
+            # on first request TTFT by paying the ~200 ms cuBLAS / kernel
+            # JIT cold-start cost during engine init instead of on the
+            # critical path. Trade-off: ~200 ms added to engine startup,
+            # amortized across all requests in the engine's lifetime.
+            if is_home:
+                try:
+                    self.collective_rpc("sage_warmup_blender")
+                except Exception as e:
+                    logger.warning(
+                        "[SAGE_WARMUP] failed (non-fatal): %s", e,
                     )
 
         self.structured_output_manager = StructuredOutputManager(vllm_config)
@@ -321,13 +363,16 @@ class EngineCore:
             "ENABLE_SAGE", "False"
         ).lower() == "true"
 
-        self.enable_gpu_blending = os.environ.get(
-            "ENABLE_GPU_BLEND", "False"
-        ).lower() == "true"
-
-        # Remote chunks whose KV has been received (home GPU only).
+        # Remote chunks whose HEADER has been received (home GPU only).
         # parent_id -> {chunk_req_id: (position, dest_block_ids, num_tokens)}
         self._sage_remote_chunks_received: dict[str, dict[str, tuple]] = {}
+        # Count of remote chunks whose per-layer drain has FULLY completed
+        # (all 36 layers received + injected + GPU-synced). Used by
+        # _maybe_launch_parent to ensure the parent doesn't launch before
+        # all chunks' KV is in the cache.
+        self._sage_remote_drains_done: dict[str, int] = {}
+        # Parents whose drains failed — these will never launch.
+        self._sage_drain_failed: set[str] = set()
         # chunk_request_id -> token_ids (for parallel prefill KV transfer).
         self._chunk_token_ids_by_req_id: dict[str, list[int]] = {}
         # Home GPU: positions we know are local for each parent.
@@ -336,6 +381,22 @@ class EngineCore:
         # Home GPU: remote positions we've started receiving for.
         # parent_id -> set of positions (to avoid double-starting)
         self._sage_recv_started: dict[str, set[int]] = {}
+        # Home GPU 3+ GPU mode: parents auto-registered from remote chunks
+        # that the frontend output_processor doesn't know about yet. These
+        # are drained into the next EngineCoreOutputs in step().
+        self._sage_pending_parent_announcements: list = []
+        # Per-layer concurrent recv: completion events from background
+        # payload threads. Items are (parent_id, chunk_req_id).
+        import queue as _queue
+        import threading as _threading
+        self._sage_payload_done: "_queue.Queue[tuple[str, str]]" = (
+            _queue.Queue()
+        )
+        # Per-(parent_id, layer_idx) → number of chunks that have finished
+        # injecting that layer. Updated by background recv threads, read by
+        # the engine core main thread to decide when to fire early blend.
+        self._sage_layer_arrivals: dict[tuple[str, int], int] = {}
+        self._sage_layer_arrivals_lock = _threading.Lock()
         # Concurrent prefill state tracking
         self.chunk_groups: dict[str, list[str]] = {}  # parent_req_id -> [chunk_req_ids]
         self.chunk_completion: dict[str, set[str]] = {}  # parent_req_id -> completed chunks
@@ -353,6 +414,11 @@ class EngineCore:
         self._concurrent_query_token_count: dict[str, int] = {}
         # parent_id -> {chunk_id: [MultiModalFeatureSpec, ...]}
         self._concurrent_chunk_mm_features: dict[str, dict[int, list]] = {}
+        # Track all parent_ids that have ever been submitted in this engine
+        # lifetime. Reusing a parent_id causes silent parent-assembly
+        # failures (chunks are accepted but the assembled parent is
+        # discarded, returning empty outputs). Fail loudly instead.
+        self._concurrent_consumed_parent_ids: set[str] = set()
         # parent_id -> {chunk_req_id: [[t,h,w], ...]} for remote chunks
         self._sage_remote_image_grid_thw: dict[str, dict[str, list]] = {}
 
@@ -493,7 +559,23 @@ class EngineCore:
                 )
 
             parent_id = request.parent_request_id
+            # Detect reuse of a parent_id whose parent has already been
+            # assembled/launched. Without this check, subsequent chunks
+            # under the same parent_id are silently accepted but the new
+            # parent-assembly never reaches the scheduler, leaving the
+            # caller to receive empty outputs from llm.generate().
+            if (
+                parent_id in self._concurrent_consumed_parent_ids
+                and parent_id not in self.concurrent_chunk_payloads
+            ):
+                raise ValueError(
+                    f"parent_request_id={parent_id!r} was already used by a "
+                    "previous concurrent-prefill request. request_ids must be "
+                    "unique across the engine's lifetime. (Hint: append a "
+                    "per-request counter to the request_id.)"
+                )
             chunk_payloads = self.concurrent_chunk_payloads.setdefault(parent_id, {})
+            self._concurrent_consumed_parent_ids.add(parent_id)
             if request.chunk_id in chunk_payloads:
                 raise ValueError(
                     f"Duplicate chunk_id={request.chunk_id} for "
@@ -599,6 +681,66 @@ class EngineCore:
                 self._sage_instance_rank,
                 _time.perf_counter(),
             )
+
+            # SAGE pipelined-blend optimization: in per-layer mode, send
+            # the chunk header to the home GPU NOW (before this worker
+            # has done any forward compute on the chunk). This lets the
+            # home start its per-layer recv loop in parallel with the
+            # worker's prefill, instead of waiting until the end. With
+            # this, the early-blend trigger fires after layer 1 of the
+            # actual worker prefill (~10 ms in), giving the blend the
+            # full worker prefill time to overlap behind.
+            if (
+                self.sage_parallel_prefill
+                and self._sage_per_layer_transfer
+                and self._sage_instance_rank != self._sage_home_rank
+                and request.home_kv_address
+            ):
+                num_tokens = len(request.prompt_token_ids)
+                block_size = self.vllm_config.cache_config.block_size
+                num_blocks = (num_tokens + block_size - 1) // block_size
+                transfer_id = (
+                    f"sage_{parent_id}_pos_{request.position}"
+                )
+                # Use the originally-requested sampling params (before
+                # we forced max_tokens=1 for chunk-only execution above).
+                sp = self.concurrent_parent_sampling_params.get(parent_id)
+                try:
+                    # Send header via SageKVTransferEngine (available
+                    # on all worker instances in both bulk and per-layer).
+                    header = torch.tensor(
+                        [
+                            num_tokens, num_blocks,
+                            self.concurrent_total_chunks.get(parent_id, 0),
+                            sp.max_tokens if sp else 1,
+                            sp.min_tokens if sp else 0,
+                            self._concurrent_query_token_count.get(
+                                parent_id, 0
+                            ),
+                        ] + list(request.prompt_token_ids),
+                        dtype=torch.long,
+                        device=self._sage_kv_transfer.device,
+                    )
+                    self._sage_kv_transfer._nccl_engine.send_tensor(
+                        f"{transfer_id}#header",
+                        header,
+                        request.home_kv_address,
+                    )
+                    logger.info(
+                        "[SAGE_PARALLEL] Worker rank=%d sent EARLY header "
+                        "for chunk %s (%d tokens, %d blocks, pos=%d)",
+                        self._sage_instance_rank,
+                        request.request_id,
+                        num_tokens,
+                        num_blocks,
+                        request.position,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[SAGE_PARALLEL] Early header send failed: %s",
+                        e,
+                    )
+
             self.scheduler.add_request(request)
             logger.info(
                 "[SAGE_CONCURRENT] Added chunk request %s "
@@ -669,13 +811,24 @@ class EngineCore:
                 and self._sage_instance_rank == self._sage_home_rank
             ):
                 self._process_remote_chunk_arrivals()
+                self._drain_recompute_events()
             return {}, False
+        # Parallel prefill: drain any recompute events that arrived
+        # between the previous step end and this step start, BEFORE
+        # the scheduler runs the parent's forward. Otherwise the
+        # layerwise state (current_layer, selected_indices) is stale.
+        if (
+            self.sage_parallel_prefill
+            and self._sage_instance_rank == self._sage_home_rank
+        ):
+            self._drain_recompute_events()
+
         # Stash per-chunk RoPE tasks on the connector impl BEFORE schedule()
         scheduler_output = self.scheduler.schedule()
-        # Worker GPU: patch connector metadata so P2pNcclConnector sends
-        # per-layer KV to the home GPU during the forward pass.
+        # Worker GPU: populate pending sends so the save_kv_layer callback
+        # sends per-layer KV to home via SageKVTransferEngine during forward.
         if self._sage_per_layer_transfer:
-            self._patch_sage_per_layer_meta(scheduler_output)
+            self._populate_pending_sends(scheduler_output)
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with self.log_error_detail(scheduler_output):
@@ -699,9 +852,24 @@ class EngineCore:
             import time as _time
             _t0 = _time.perf_counter()
             self._process_remote_chunk_arrivals()
+            # Drain pipelined recompute events that arrived during
+            # model execution (they sit in input_queue).
+            self._drain_recompute_events()
             logger.info(
                 "[SAGE_TIMING] step_end_poll t=%.6f", _time.perf_counter(),
             )
+
+        # Drain pending parent auto-registration announcements into the
+        # outputs so the frontend can register them in output_processor.
+        if self._sage_pending_parent_announcements:
+            from vllm.v1.engine import EngineCoreOutputs
+            announcements = self._sage_pending_parent_announcements
+            self._sage_pending_parent_announcements = []
+            eco = engine_core_outputs.get(0)
+            if eco is None:
+                eco = EngineCoreOutputs()
+                engine_core_outputs[0] = eco
+            eco.concurrent_parents_added = announcements
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
@@ -773,7 +941,7 @@ class EngineCore:
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
             if self._sage_per_layer_transfer:
-                self._patch_sage_per_layer_meta(scheduler_output)
+                self._populate_pending_sends(scheduler_output)
             exec_future = self.model_executor.execute_model(
                 scheduler_output, non_block=True
             )
@@ -1131,7 +1299,15 @@ class EngineCore:
                 and self._sage_instance_rank != self._sage_home_rank
             ):
                 if self._sage_per_layer_transfer:
-                    self._send_chunk_header_to_home(req_id, parent_id)
+                    # Header was already sent EARLY in
+                    # _handle_concurrent_request to enable pipelined
+                    # blend overlap. Nothing more to do here — the
+                    # per-layer KV streamed during forward via
+                    # SageKVTransferEngine callback and is already in
+                    # home's recv_store ready to be drained.
+                    self.scheduler.free_sage_chunk_blocks(
+                        parent_id, chunk_req_id=req_id,
+                    )
                 else:
                     self._send_chunk_kv_to_home(req_id, parent_id)
                 continue
@@ -1257,65 +1433,80 @@ class EngineCore:
                 parent_id, 0
             ),
         )
-        self.scheduler.free_sage_chunk_blocks(parent_id)
-
-    def _patch_sage_per_layer_meta(self, scheduler_output) -> None:
-        """Worker GPU: patch kv_connector_metadata so P2pNcclConnector
-        sends per-layer KV to the home GPU during the forward pass.
-
-        P2pNcclConnector.build_connector_meta already accumulated block_ids
-        across internal chunks. We just set dest_address and change
-        request_id to the SAGE transfer_id so home can match per-layer
-        tensor_ids.
-        """
-        from vllm.distributed.kv_transfer.kv_connector.v1.p2p.p2p_nccl_connector import (
-            P2pNcclConnectorMetadata,
+        self.scheduler.free_sage_chunk_blocks(
+            parent_id, chunk_req_id=chunk_req_id,
         )
-        meta = scheduler_output.kv_connector_metadata
-        if meta is None or not isinstance(meta, P2pNcclConnectorMetadata):
+
+    def _populate_pending_sends(self, scheduler_output) -> None:
+        """Worker GPU: populate SageKVTransferEngine._pending_sends so
+        the save_kv_layer callback sends per-layer KV during forward.
+
+        Iterates scheduled requests, finds SAGE chunks, and builds
+        send info (transfer_id, block_ids tensor, dest_address).
+        """
+        if self._sage_kv_transfer is None:
             return
-        for req_meta in meta.requests:
-            parent_id = self.chunk_to_parent.get(req_meta.request_id)
+        pending = []
+        # Check new requests scheduled this step.
+        for new_req in scheduler_output.scheduled_new_reqs:
+            parent_id = self.chunk_to_parent.get(new_req.req_id)
             if parent_id is None:
                 continue
-            position = self._chunk_req_to_position.get(req_meta.request_id)
+            position = self._chunk_req_to_position.get(new_req.req_id)
             if position is None:
                 continue
             template = self.concurrent_parent_template.get(parent_id)
             if template is None or not template.home_kv_address:
                 continue
             transfer_id = f"sage_{parent_id}_pos_{position}"
-            req_meta.request_id = transfer_id
-            req_meta.dest_address = template.home_kv_address
-
-    def _send_chunk_header_to_home(
-        self, chunk_req_id: str, parent_id: str,
-    ) -> None:
-        """Worker EngineCore: tell worker process to send token_ids header
-        to home GPU via collective_rpc.
-        """
-        position = self._chunk_req_to_position.get(chunk_req_id)
-        if position is None:
-            raise RuntimeError(f"No position for chunk {chunk_req_id}")
-        template = self.concurrent_parent_template.get(parent_id)
-        if template is None or not template.home_kv_address:
-            raise RuntimeError(f"No home_kv_address for parent {parent_id}")
-        token_ids = self._chunk_token_ids_by_req_id.get(chunk_req_id)
-        if not token_ids:
-            raise RuntimeError(f"No token_ids for chunk {chunk_req_id}")
-
-        transfer_id = f"sage_{parent_id}_pos_{position}"
-        self.collective_rpc(
-            "sage_send_chunk_header",
-            args=(transfer_id, token_ids, template.home_kv_address),
-        )
-        logger.info(
-            "[SAGE_PARALLEL] Worker rank=%d sent header for chunk %s "
-            "(%d tokens, pos=%d)",
-            self._sage_instance_rank, chunk_req_id,
-            len(token_ids), position,
-        )
-        self.scheduler.free_sage_chunk_blocks(parent_id)
+            block_ids = new_req.block_ids[0] if new_req.block_ids else []
+            block_ids_t = torch.tensor(
+                block_ids, dtype=torch.long,
+                device=self._sage_kv_transfer.device,
+            )
+            pending.append({
+                "transfer_id": transfer_id,
+                "block_ids": block_ids_t,
+                "dest_address": template.home_kv_address,
+            })
+            logger.info(
+                "[SAGE_PER_LAYER_SEND] rank=%d queued %s -> %s "
+                "(%d blocks) dest=%s",
+                self._sage_instance_rank, new_req.req_id,
+                transfer_id, len(block_ids),
+                template.home_kv_address,
+            )
+        # Also check cached requests (chunked prefill continuation).
+        cached = scheduler_output.scheduled_cached_reqs
+        for i, req_id in enumerate(cached.req_ids):
+            parent_id = self.chunk_to_parent.get(req_id)
+            if parent_id is None:
+                continue
+            position = self._chunk_req_to_position.get(req_id)
+            if position is None:
+                continue
+            template = self.concurrent_parent_template.get(parent_id)
+            if template is None or not template.home_kv_address:
+                continue
+            transfer_id = f"sage_{parent_id}_pos_{position}"
+            new_block_ids = cached.new_block_ids[i]
+            if new_block_ids is not None:
+                # For continued chunked prefill, accumulate all blocks.
+                block_ids = new_block_ids[0]
+            else:
+                block_ids = []
+            if not block_ids:
+                continue
+            block_ids_t = torch.tensor(
+                block_ids, dtype=torch.long,
+                device=self._sage_kv_transfer.device,
+            )
+            pending.append({
+                "transfer_id": transfer_id,
+                "block_ids": block_ids_t,
+                "dest_address": template.home_kv_address,
+            })
+        self._sage_kv_transfer._pending_sends = pending
 
     def _receive_remote_chunk(
         self,
@@ -1349,63 +1540,193 @@ class EngineCore:
             )
 
         image_grid_thw: list[list[int]] = []
+        payload_thread = None
         if self._sage_per_layer_transfer:
-            token_ids, dest_block_ids, num_tokens, num_blocks = (
-                self._sage_kv_transfer.recv_chunk_per_layer(
-                    transfer_id=transfer_id,
-                    allocate_blocks_fn=_allocate,
-                )
+            # Step 1: receive the (small) header on the main thread.
+            # This unblocks alloc + state registration immediately.
+            meta = self._sage_kv_transfer.recv_chunk_per_layer_header(
+                transfer_id
             )
+            dest_block_ids = _allocate(meta["num_blocks"])
+            result = {
+                "token_ids": meta["token_ids"],
+                "dest_block_ids": dest_block_ids,
+                "num_tokens": meta["num_tokens"],
+                "num_blocks": meta["num_blocks"],
+                "image_grid_thw": [],
+                "total_chunks": meta["total_chunks"],
+                "max_tokens": meta["max_tokens"],
+                "min_tokens": meta["min_tokens"],
+                "query_token_count": meta["query_token_count"],
+            }
+            # Step 2: spawn a background thread to drain the per-layer
+            # payload. Multiple chunks can be draining concurrently —
+            # this is the whole point of per-layer mode on slow links.
+            import threading as _threading
+            done_queue = self._sage_payload_done
+            input_queue = getattr(self, "input_queue", None)
+            arrivals = self._sage_layer_arrivals
+            arrivals_lock = self._sage_layer_arrivals_lock
+            # Number of blend layers (configurable via env, default 2).
+            # We watch arrivals up to this many layers and trigger early
+            # blend when all chunks have completed all blend layers.
+            pre_ttft_ratio = float(
+                os.environ.get("SAGE_LAYERWISE_PRE_TTFT_RATIO", "0.0")
+            )
+            num_layers = self._sage_kv_transfer._num_layers
+            _strategy_env = os.environ.get(
+                "LMCACHE_BLEND_INCREMENTAL_STRATEGY", "layer_wise"
+            )
+            if os.environ.get("SAGE_DISABLE_EARLY_BLEND", "0") == "1":
+                blend_layers_count = 0  # disable all pipelined recompute
+            elif _strategy_env == "layer_wise":
+                # Layerwise: only process ptt fraction of layers during
+                # drain. Remaining layers use fused inject during decode.
+                blend_layers_count = max(2, int(num_layers * pre_ttft_ratio))
+            else:
+                # Sync cacheblend / tokenwise: process all layers during
+                # drain so sage_process_layer handles everything and
+                # early_blend_done prevents double processing.
+                blend_layers_count = num_layers
+
+            # Read expected_chunks at call time (not closure time)
+            # because concurrent_total_chunks may not be set yet when
+            # the first chunk's drain thread is created.
+            _total_chunks_dict = self.concurrent_total_chunks
+
+            def _on_layer_done(L, pid=parent_id):
+                expected = _total_chunks_dict.get(pid, 0)
+                with arrivals_lock:
+                    arrivals[(pid, L)] = arrivals.get((pid, L), 0) + 1
+                    count = arrivals.get((pid, L), 0)
+                    layer_ready = (count == expected and expected > 0)
+                if not layer_ready:
+                    return
+                if L < blend_layers_count:
+                    # Pipelined recompute: process this layer
+                    # (L0-L1 scoring, L2+ M-token recompute).
+                    if input_queue is not None:
+                        try:
+                            input_queue.put_nowait(
+                                ("_SAGE_RECOMPUTE_LAYER", pid, L)
+                            )
+                        except Exception:
+                            pass
+
+            def _drain_payload(
+                tid=transfer_id,
+                dest=dest_block_ids,
+                pid_local=parent_id,
+                cid_local=chunk_req_id,
+            ):
+                _error = None
+                try:
+                    self._sage_kv_transfer.recv_chunk_per_layer_payload(
+                        tid, dest, on_layer_done=_on_layer_done,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "[SAGE_PARALLEL] Drain FAILED for %s chunk %s",
+                        pid_local, cid_local, exc_info=True,
+                    )
+                    _error = exc
+                # Always signal done (with optional error) so the parent
+                # doesn't hang forever.
+                done_queue.put((pid_local, cid_local, _error))
+                # Wake the main busy loop so it drains the done queue.
+                if input_queue is not None:
+                    try:
+                        input_queue.put_nowait(("_SAGE_REMOTE_KV",))
+                    except Exception:
+                        pass
+
+            payload_thread = _threading.Thread(
+                target=_drain_payload,
+                name=f"sage-recv-{transfer_id}",
+                daemon=True,
+            )
+            payload_thread.start()
         else:
             result = self._sage_kv_transfer.recv_chunk(
                 transfer_id=transfer_id,
                 allocate_blocks_fn=_allocate,
             )
-            token_ids = result["token_ids"]
-            dest_block_ids = result["dest_block_ids"]
-            num_tokens = result["num_tokens"]
-            num_blocks = result["num_blocks"]
-            image_grid_thw = result["image_grid_thw"]
+        token_ids = result["token_ids"]
+        dest_block_ids = result["dest_block_ids"]
+        num_tokens = result["num_tokens"]
+        num_blocks = result["num_blocks"]
+        image_grid_thw = result["image_grid_thw"]
 
-            # Auto-register parent if home has no local chunks (3-GPU mode).
-            # The first remote chunk carries enough metadata to set up
-            # the parent tracking that normally happens when a local
-            # chunk is submitted via _handle_concurrent_request.
-            if parent_id not in self.concurrent_total_chunks:
-                total = result["total_chunks"]
-                if total > 0:
-                    self.concurrent_total_chunks[parent_id] = total
-                    self.chunk_completion.setdefault(parent_id, set())
-                    self.chunk_groups.setdefault(parent_id, [])
-                    self._concurrent_query_token_count[parent_id] = (
-                        result["query_token_count"]
-                    )
-                    from vllm.sampling_params import SamplingParams
-                    sp = SamplingParams(
-                        temperature=0.0,
-                        max_tokens=result["max_tokens"],
-                        min_tokens=result["min_tokens"],
-                    )
-                    self.concurrent_parent_sampling_params[parent_id] = sp
-                    # Create a minimal template Request for parent assembly.
-                    from vllm.v1.request import Request
-                    template = Request(
+        # Auto-register parent if home has no local chunks (3+ GPU mode).
+        # The first remote chunk carries enough metadata to set up
+        # the parent tracking that normally happens when a local
+        # chunk is submitted via _handle_concurrent_request.
+        if parent_id not in self.concurrent_total_chunks:
+            total = result["total_chunks"]
+            if total > 0:
+                self.concurrent_total_chunks[parent_id] = total
+                self.chunk_completion.setdefault(parent_id, set())
+                self.chunk_groups.setdefault(parent_id, [])
+                self._concurrent_query_token_count[parent_id] = (
+                    result["query_token_count"]
+                )
+                from vllm.sampling_params import SamplingParams
+                sp = SamplingParams(
+                    temperature=0.0,
+                    max_tokens=result["max_tokens"],
+                    min_tokens=result["min_tokens"],
+                )
+                self.concurrent_parent_sampling_params[parent_id] = sp
+                # Create a minimal template Request for parent assembly.
+                from vllm.v1.request import Request
+                template = Request(
+                    request_id=parent_id,
+                    prompt_token_ids=token_ids,
+                    sampling_params=sp,
+                    pooling_params=None,
+                    eos_token_id=getattr(
+                        self.vllm_config.model_config.hf_config,
+                        "eos_token_id",
+                        None,
+                    ),
+                    arrival_time=_time.perf_counter(),
+                    lora_request=None,
+                    request_type="concurrent",
+                    parent_request_id=parent_id,
+                    total_chunks=total,
+                )
+                self.concurrent_parent_template[parent_id] = template
+                # Notify the frontend so output_processor can track
+                # this parent. Sent on next step() in EngineCoreOutputs.
+                from vllm.v1.engine import EngineCoreRequest
+                self._sage_pending_parent_announcements.append(
+                    EngineCoreRequest(
                         request_id=parent_id,
-                        prompt_token_ids=token_ids,
+                        prompt_token_ids=[],
+                        mm_features=None,
                         sampling_params=sp,
-                        eos_token_id=self.scheduler.eos_token_id,
+                        pooling_params=None,
+                        eos_token_id=(
+                            lambda _eid: _eid[0] if isinstance(_eid, list) else _eid
+                        )(getattr(
+                            self.vllm_config.model_config.hf_config,
+                            "eos_token_id",
+                            None,
+                        )),
                         arrival_time=_time.perf_counter(),
                         lora_request=None,
+                        cache_salt=None,
+                        data_parallel_rank=None,
                         request_type="concurrent",
                         parent_request_id=parent_id,
                         total_chunks=total,
                     )
-                    self.concurrent_parent_template[parent_id] = template
-                    logger.info(
-                        "[SAGE_PARALLEL] Auto-registered parent %s from "
-                        "remote chunk (total_chunks=%d, max_tokens=%d)",
-                        parent_id, total, result["max_tokens"],
-                    )
+                )
+                logger.info(
+                    "[SAGE_PARALLEL] Auto-registered parent %s from "
+                    "remote chunk (total_chunks=%d, max_tokens=%d)",
+                    parent_id, total, result["max_tokens"],
+                )
 
         # Update num_tokens in sage_parent_chunk_blocks.
         for i, entry in enumerate(
@@ -1434,47 +1755,193 @@ class EngineCore:
             (_time.perf_counter() - _t_recv_start) * 1000,
         )
 
-        self._maybe_launch_parent(parent_id)
+        # In per-layer mode the actual KV is still being drained by the
+        # background thread; the launch happens later when the thread
+        # signals completion via _sage_payload_done. In bulk mode all
+        # KV is already in place, so we can launch immediately.
+        if payload_thread is None:
+            # Bulk mode: KV is fully received, count as drain-done.
+            self._sage_remote_drains_done[parent_id] = (
+                self._sage_remote_drains_done.get(parent_id, 0) + 1
+            )
+            self._maybe_launch_parent(parent_id)
+
+    def _drain_recompute_events(self) -> None:
+        """Process any pending _SAGE_RECOMPUTE_LAYER events from the
+        input queue. Called during step() so recompute events that
+        arrive while the model is executing get processed promptly.
+        """
+        _input_q = getattr(self, "input_queue", None)
+        if _input_q is None:
+            return
+        requeued = []
+        while not _input_q.empty():
+            try:
+                req = _input_q.get_nowait()
+            except Exception:
+                break
+            if (
+                isinstance(req, tuple) and len(req) >= 3
+                and req[0] == "_SAGE_RECOMPUTE_LAYER"
+            ):
+                self._sage_run_pipelined_recompute(req[1], req[2])
+            else:
+                # Not a recompute event — put it back.
+                requeued.append(req)
+        for item in requeued:
+            _input_q.put_nowait(item)
+
+    def _sage_run_pipelined_recompute(
+        self, parent_id: str, layer_idx: int,
+    ) -> None:
+        """Process a single layer for pipelined scoring/recompute.
+
+        Called from the main loop when layer_idx has been drained from
+        all chunks. For L0-L1: scoring (diff-k). For L2+: M-token
+        recompute. All layers: RoPE correction first.
+        """
+        if parent_id in self._sage_drain_failed:
+            return
+        # On first layer, set up cached prompt inputs for the adapter.
+        if layer_idx == 0:
+            remote_info = self._sage_remote_chunks_received.get(parent_id, {})
+            if not remote_info:
+                return
+            # Gather all chunk token_ids and block_ids in position order.
+            chunk_payloads = self.concurrent_chunk_payloads.get(parent_id, {})
+            chunk_positions = self.concurrent_chunk_positions.get(parent_id, {})
+            all_token_ids: list[int] = []
+            all_block_ids: list[int] = []
+            chunk_boundaries: list[int] = [0]
+            for pos in sorted(chunk_positions.keys()):
+                cid = chunk_positions[pos]
+                tids = chunk_payloads.get(cid, [])
+                all_token_ids.extend(tids)
+                chunk_boundaries.append(len(all_token_ids))
+                # Get block_ids for this position.
+                if cid in remote_info:
+                    _, dest_blocks, _ = remote_info[cid]
+                    all_block_ids.extend(dest_blocks)
+            if not all_token_ids:
+                return
+            N = len(all_token_ids)
+            device = self._sage_kv_transfer.device
+            block_size = 16  # TODO: get from config
+            token_ids_t = torch.tensor(
+                all_token_ids, dtype=torch.long, device=device,
+            )
+            block_ids_t = torch.tensor(
+                all_block_ids, dtype=torch.long, device=device,
+            )
+            positions = torch.arange(N, device=device, dtype=torch.long)
+            blend_slot_mapping = (
+                block_ids_t[positions // block_size] * block_size
+                + positions % block_size
+            )
+            # Store for the adapter.
+            _query_tc = self._concurrent_query_token_count.get(parent_id, 0)
+            self.collective_rpc(
+                "sage_setup_pipelined_prompt",
+                args=(
+                    parent_id, token_ids_t, blend_slot_mapping,
+                    chunk_boundaries, N, _query_tc,
+                ),
+            )
+
+        try:
+            self.collective_rpc(
+                "sage_run_pipelined_recompute_layer",
+                args=(parent_id, layer_idx),
+            )
+        except Exception as e:
+            logger.warning(
+                "[SAGE_RECOMPUTE] Layer %d failed for %s: %s",
+                layer_idx, parent_id, e,
+            )
+            return
 
     def _process_remote_chunk_arrivals(self) -> None:
         """Home GPU: check if any remote chunks have data in recv_store.
 
         For each parent we know about, check all remote positions.
-        Also scan recv_store for unregistered parents (3-GPU mode
+        Also scan recv_store for unregistered parents (3+ GPU mode
         where home has no local chunks).
+
+        In per-layer mode, the actual KV draining happens on background
+        threads. We only need a chunk's #header to be present to start
+        receiving — multiple chunks can drain in parallel.
         """
         if self._sage_kv_transfer is None:
             return
         nccl_engine = self._sage_kv_transfer._nccl_engine
-        num_layers = self._sage_kv_transfer._num_layers
 
-        # Discover unregistered parents from recv_store keys (3-GPU mode
-        # where home has no local chunks). Scan for ready chunks from
-        # unknown parents and process one per call to trigger auto-registration.
-        unregistered_ready = None
+        # Drain payload-completion notifications from background recv
+        # threads (per-layer mode). Each item means one chunk has been
+        # fully received into its destination blocks.
+        while True:
+            try:
+                item = self._sage_payload_done.get_nowait()
+            except Exception:
+                break
+            pid_done, _cid_done = item[0], item[1]
+            _drain_err = item[2] if len(item) > 2 else None
+            if _drain_err is not None:
+                logger.error(
+                    "[SAGE_PARALLEL] Aborting parent %s: drain failed "
+                    "for chunk %s: %s", pid_done, _cid_done, _drain_err,
+                )
+                self._sage_drain_failed.add(pid_done)
+                continue
+            # Track actual drain completions (not just header arrivals)
+            self._sage_remote_drains_done[pid_done] = (
+                self._sage_remote_drains_done.get(pid_done, 0) + 1
+            )
+            logger.info(
+                "[SAGE_PARALLEL] Drain done for %s chunk %s "
+                "(%d/%d remote drains complete)",
+                pid_done, _cid_done,
+                self._sage_remote_drains_done[pid_done],
+                len(self._sage_remote_chunks_received.get(pid_done, {})),
+            )
+            self._maybe_launch_parent(pid_done)
+
+        # In per-layer mode, the readiness sentinel is just #header
+        # (the payload thread will block until all layers arrive).
+        # In bulk mode, we need #metadata to know what to recv.
+        if self._sage_per_layer_transfer:
+            sentinel_suffix = "#header"
+        else:
+            sentinel_suffix = "#metadata"
+
+        # Discover unregistered parents from recv_store keys (3+ GPU mode
+        # where home has no local chunks). Scan for headers from unknown
+        # parents and process them all in one pass — per-layer mode can
+        # start multiple background drains in parallel.
+        unregistered: list[tuple[str, int]] = []
         with nccl_engine.recv_store_cv:
             for key in nccl_engine.recv_store:
-                if not key.endswith("#metadata"):
+                if not key.endswith(sentinel_suffix):
                     continue
-                # key = "sage_{parent_id}_pos_{N}#metadata"
-                prefix = key[: -len("#metadata")]  # "sage_{pid}_pos_{N}"
+                prefix = key[: -len(sentinel_suffix)]
                 parts = prefix.rsplit("_pos_", 1)
                 if len(parts) != 2:
                     continue
-                pid = parts[0][len("sage_"):]  # extract parent_id
+                pid = parts[0][len("sage_"):]
                 pos = int(parts[1])
                 if pid in self.concurrent_total_chunks:
                     continue  # already registered
-                bulk_key = f"{prefix}#bulk_kv"
-                if bulk_key in nccl_engine.recv_store:
-                    unregistered_ready = (pid, pos)
-                    break
-        if unregistered_ready is not None:
-            pid, pos = unregistered_ready
+                if self._sage_per_layer_transfer:
+                    unregistered.append((pid, pos))
+                else:
+                    bulk_key = f"{prefix}#bulk_kv"
+                    if bulk_key in nccl_engine.recv_store:
+                        unregistered.append((pid, pos))
+        for pid, pos in unregistered:
             started = self._sage_recv_started.setdefault(pid, set())
-            if pos not in started:
-                started.add(pos)
-                self._receive_remote_chunk(pid, pos)
+            if pos in started:
+                continue
+            started.add(pos)
+            self._receive_remote_chunk(pid, pos)
 
         for parent_id, total in list(self.concurrent_total_chunks.items()):
             local_pos = self._sage_local_positions.get(parent_id, set())
@@ -1486,42 +1953,40 @@ class EngineCore:
                 transfer_id = f"sage_{parent_id}_pos_{pos}"
                 with nccl_engine.recv_store_cv:
                     if self._sage_per_layer_transfer:
-                        has_header = (
-                            f"{transfer_id}#header" in nccl_engine.recv_store
-                        )
-                        layer_names = self._sage_attention_layer_names
-                        layers_arrived = sum(
-                            1 for name in layer_names
-                            if f"{transfer_id}#{name}"
+                        ready = (
+                            f"{transfer_id}#header"
                             in nccl_engine.recv_store
-                        )
-                        all_ready = (
-                            has_header and layers_arrived == num_layers
                         )
                     else:
-                        has_meta = (
+                        ready = (
                             f"{transfer_id}#metadata"
                             in nccl_engine.recv_store
-                        )
-                        has_bulk = (
-                            f"{transfer_id}#bulk_kv"
+                            and f"{transfer_id}#bulk_kv"
                             in nccl_engine.recv_store
                         )
-                        all_ready = has_meta and has_bulk
-                if not all_ready:
+                if not ready:
                     continue
                 started.add(pos)
                 self._receive_remote_chunk(parent_id, pos)
 
     def _maybe_launch_parent(self, parent_id: str) -> None:
         """Check if all chunks (local + remote) are done and launch parent."""
+        if parent_id in self._sage_drain_failed:
+            logger.error(
+                "[SAGE_PARALLEL] Parent %s: drain failed, aborting",
+                parent_id,
+            )
+            self._partial_cleanup_chunk_state(parent_id)
+            self._sage_drain_failed.discard(parent_id)
+            return
         expected_total = self.concurrent_total_chunks.get(parent_id)
         if expected_total is None:
             return
         local_done = len(self.chunk_completion.get(parent_id, set()))
-        remote_done = len(
-            self._sage_remote_chunks_received.get(parent_id, {})
-        )
+        # Use drain completion count, NOT header arrival count.
+        # Headers arrive almost instantly; drains take time to inject
+        # all 36 layers of KV into the cache.
+        remote_done = self._sage_remote_drains_done.get(parent_id, 0)
         total_done = local_done + remote_done
         logger.info(
             "[SAGE_PARALLEL] Parent %s: %d local + %d remote = %d/%d",
@@ -1534,6 +1999,18 @@ class EngineCore:
         if total_done < expected_total:
             return
 
+        # Drain ALL pending recompute events before launching the parent.
+        # This ensures sage_process_layer has processed every queued
+        # layer event (so layerwise_current_layer reflects the true
+        # number of layers processed). Without this, the parent's blend
+        # callback sees a stale current_layer and the layerwise strategy
+        # starts injection from the wrong layer (race between drain and
+        # launch).
+        self._drain_recompute_events()
+
+        # If early blend was triggered for this parent but the background
+        # blend thread hasn't completed yet, defer the launch. The blend
+        # thread will wake the busy loop when it finishes, and we'll
         # All done — build and launch parent.
         if parent_id not in self.parent_requests:
             self.parent_requests[parent_id] = (
@@ -1585,7 +2062,7 @@ class EngineCore:
         logger.info("[SAGE_TIMING] launch_start t=%.6f", _t_launch)
 
         # Always do zero-copy transfer when SAGE is enabled
-        if self.enable_gpu_blending:
+        if self.enable_sage:
             transfer_result = self.scheduler.transfer_sage_blocks_to_parent_zero_copy(parent_id)
         else:
             transfer_result = None
@@ -1600,9 +2077,15 @@ class EngineCore:
                     f"transferred={total_tokens} prompt_len={prompt_len}"
                 )
 
-            # Set num_computed_tokens so scheduler knows these tokens are done
-            # Leave at least 1 token for the scheduler to process
-            parent_request.num_computed_tokens = min(total_tokens, prompt_len - 1)
+            # The vLLM 1-token suffix prefill at position prompt_len-1
+            # is needed to produce logits for the first output token.
+            # However, it uses paged FlashAttention which is not batch-
+            # invariant in FA2, causing hash mismatches between solo
+            # and batched runs. At ptt<1.0 the suffix rerecompute
+            # fused inject overwrites the batch-sensitive values.
+            parent_request.num_computed_tokens = min(
+                total_tokens, prompt_len - 1,
+            )
 
             logger.info(
                 f"[SAGE_ZERO_COPY] Parent {parent_id}: prompt_len={prompt_len}, "
@@ -1623,7 +2106,7 @@ class EngineCore:
             parent_request.sage_blocks_transferred = False
             # Free chunk blocks since we're using CPU path - KV will be retrieved from LMCache
             self.scheduler.free_sage_chunk_blocks(parent_id)
-
+        # Hash KV cache for this parent RIGHT BEFORE decode starts.
         # Add parent request to scheduler
         # Since blocks are already in req_to_blocks, allocate_slots will only
         # allocate blocks for the remaining (1 or few) tokens
@@ -1631,9 +2114,8 @@ class EngineCore:
             f"[SAGE_ZERO_COPY] Adding parent {parent_id} to scheduler, "
             f"sage_blocks_transferred={parent_request.sage_blocks_transferred}"
         )
-        self.scheduler.add_request(parent_request)
 
-        # Clean up parent tracking
+        self.scheduler.add_request(parent_request)
         self._partial_cleanup_chunk_state(parent_id)
 
         logger.info(
@@ -1659,9 +2141,14 @@ class EngineCore:
         self._concurrent_chunk_mm_features.pop(parent_id, None)
         # SAGE parallel prefill state
         self._sage_remote_chunks_received.pop(parent_id, None)
+        self._sage_remote_drains_done.pop(parent_id, None)
         self._sage_local_positions.pop(parent_id, None)
         self._sage_recv_started.pop(parent_id, None)
         self._sage_remote_image_grid_thw.pop(parent_id, None)
+        with self._sage_layer_arrivals_lock:
+            for k in list(self._sage_layer_arrivals):
+                if k[0] == parent_id:
+                    self._sage_layer_arrivals.pop(k, None)
         # Clean up parent tracking but NOT the chunk_to_parent mapping
         # as we need that to track which chunks belong to which parent
         self.chunk_groups.pop(parent_id, None)
@@ -1692,9 +2179,14 @@ class EngineCore:
         self._concurrent_chunk_mm_features.pop(parent_id, None)
         # SAGE parallel prefill state
         self._sage_remote_chunks_received.pop(parent_id, None)
+        self._sage_remote_drains_done.pop(parent_id, None)
         self._sage_local_positions.pop(parent_id, None)
         self._sage_remote_image_grid_thw.pop(parent_id, None)
         self._sage_recv_started.pop(parent_id, None)
+        with self._sage_layer_arrivals_lock:
+            for k in list(self._sage_layer_arrivals):
+                if k[0] == parent_id:
+                    self._sage_layer_arrivals.pop(k, None)
 
     # ==================== End Concurrent Prefill Methods ====================
 
@@ -2047,6 +2539,9 @@ class EngineCoreProc(EngineCore):
             if req == ("_SAGE_REMOTE_KV",):
                 self._process_remote_chunk_arrivals()
                 continue
+            if isinstance(req, tuple) and req and req[0] == "_SAGE_RECOMPUTE_LAYER":
+                self._sage_run_pipelined_recompute(req[1], req[2])
+                continue
             self._handle_client_request(*req)
 
         if waited:
@@ -2057,6 +2552,9 @@ class EngineCoreProc(EngineCore):
             req = self.input_queue.get_nowait()
             if req == ("_SAGE_REMOTE_KV",):
                 self._process_remote_chunk_arrivals()
+                continue
+            if isinstance(req, tuple) and req and req[0] == "_SAGE_RECOMPUTE_LAYER":
+                self._sage_run_pipelined_recompute(req[1], req[2])
                 continue
             self._handle_client_request(*req)
 

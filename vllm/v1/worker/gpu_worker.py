@@ -188,22 +188,142 @@ class Worker(WorkerBase):
             if hasattr(layer, "kv_cache")
         ]
 
-    def sage_pre_connect_to_home(self, home_address: str) -> None:
-        """Pre-connect worker's P2pNcclEngine to home GPU."""
-        connector = get_kv_transfer_group()
-        connector.p2p_nccl_engine.create_connect(home_address)
-
-    def sage_send_chunk_header(
-        self, transfer_id: str, token_ids: list[int], dest_address: str,
+    def sage_register_per_layer_callback(
+        self, sage_engine, layer_name_to_idx: dict,
     ) -> None:
-        """Send token_ids header to home GPU via worker's P2pNcclEngine."""
+        """Register a callback on LMCacheConnectorV1 that sends each
+        layer's KV via SageKVTransferEngine during the forward pass.
+
+        The callback fires after each save_kv_layer call. It reads
+        sage_engine._pending_sends (populated by EngineCore before
+        each forward) to know which requests/blocks to send.
+        """
+        from vllm.distributed.kv_transfer import get_kv_transfer_group
         connector = get_kv_transfer_group()
-        header = torch.tensor(
-            [len(token_ids)] + token_ids,
-            dtype=torch.long, device=self.device_config.device,
+
+        def _on_layer_saved(layer_name: str):
+            layer_idx = layer_name_to_idx.get(layer_name)
+            if layer_idx is None:
+                return  # non-attention layer
+            for send_info in sage_engine._pending_sends:
+                sage_engine.send_layer(
+                    layer_idx=layer_idx,
+                    layer_name=layer_name,
+                    block_ids=send_info["block_ids"],
+                    dest_address=send_info["dest_address"],
+                    transfer_id=send_info["transfer_id"],
+                )
+
+        connector._sage_per_layer_send_callback = _on_layer_saved
+
+    def sage_setup_pipelined_prompt(
+        self,
+        parent_id: str,
+        token_ids: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        chunk_boundaries: list,
+        num_tokens: int,
+        query_token_count: int = 0,
+    ) -> None:
+        """Set up cached prompt inputs for pipelined recompute."""
+        from vllm.distributed.kv_transfer import get_kv_transfer_group
+        connector = get_kv_transfer_group()
+        adapter = getattr(connector, "_lmcache_engine", None)
+        if adapter is None:
+            return
+        adapter._sage_cached_prompt_inputs[parent_id] = {
+            "prompt_tokens": token_ids,
+            "prompt_slot_mapping": slot_mapping,
+            "chunk_boundaries": chunk_boundaries,
+            "prompt_len": num_tokens,
+            "query_token_count": query_token_count,
+        }
+
+    def sage_run_pipelined_recompute_layer(
+        self, parent_id: str, layer_idx: int,
+    ) -> None:
+        """RoPE correct + recompute a single layer on the home GPU.
+
+        Called from EngineCore when layer_idx's drain completes for all
+        chunks of parent_id. Handles RoPE correction for this layer,
+        then runs M selected tokens through the transformer layer.
+        """
+        from vllm.distributed.kv_transfer import get_kv_transfer_group
+        connector = get_kv_transfer_group()
+        adapter = getattr(connector, "_lmcache_engine", None)
+        if adapter is None:
+            return
+        kvcaches = self.model_runner.get_kv_caches()
+        if not kvcaches:
+            return
+        cached = adapter._sage_cached_prompt_inputs.get(parent_id)
+        if cached is None:
+            return
+        slot_mapping = cached["prompt_slot_mapping"]
+        N = int(cached["prompt_len"])
+        chunk_bounds = cached.get("chunk_boundaries")
+
+        # RoPE correct this single layer before processing.
+        if chunk_bounds is not None and len(chunk_bounds) >= 2:
+            _rope_bt = (
+                slot_mapping[:N:adapter._block_size] // adapter._block_size
+            ).clone().to(dtype=torch.long)
+            adapter._run_rope_prepass_and_remap(
+                req_id=parent_id,
+                chunk_boundaries=chunk_bounds,
+                slot_mapping=slot_mapping,
+                num_tokens=N,
+                rope_block_table=_rope_bt,
+                kvcaches=kvcaches,
+                layer_range=(layer_idx, layer_idx + 1),
+            )
+
+        # Process this layer (scoring at L0-L1, recompute at L2+).
+        # For tokenwise: override the recompute ratio at the check layer
+        # to match _run_tokenwise_pre_ttft's blend_from_gpu call.
+        token_ids = cached["prompt_tokens"]
+        _strategy = os.environ.get(
+            "LMCACHE_BLEND_INCREMENTAL_STRATEGY", "layer_wise"
         )
-        connector.p2p_nccl_engine.send_tensor(
-            f"{transfer_id}#header", header, dest_address,
+        _tw_ratio = None
+        if _strategy == "token_wise":
+            _tw_ratio = float(os.environ.get(
+                "SAGE_TOKENWISE_PRE_TTFT_RATIO",
+                os.environ.get("SAGE_LAYERWISE_PRE_TTFT_RATIO", "0.0"),
+            ))
+
+        adapter.sage_process_layer(
+            parent_id, layer_idx, kvcaches, slot_mapping, token_ids,
+            tokenwise_pre_ttft_ratio=_tw_ratio,
+        )
+
+    def sage_warmup_blender(self) -> None:
+        """Pre-warm the LMCache blender so the first real blend runs at
+        warm speed (~140 ms) instead of cold speed (~250 ms).
+
+        Runs a tiny dummy blend over a single block of tokens to JIT
+        all the CUDA kernels, allocate cuBLAS handles, populate the
+        torch caching allocator, etc. The cost (~250 ms) is paid once
+        at engine init before any real request is processed.
+        """
+        try:
+            from vllm.distributed.kv_transfer import get_kv_transfer_group
+        except ImportError:
+            return
+        connector = get_kv_transfer_group()
+        if connector is None:
+            return
+        adapter = getattr(connector, "_lmcache_engine", None)
+        if adapter is None:
+            return
+        if not hasattr(adapter, "sage_warmup_blender"):
+            return
+        kvcaches = self.model_runner.get_kv_caches()
+        if not kvcaches:
+            return
+        adapter.sage_warmup_blender(
+            device=self.device_config.device,
+            kvcaches=kvcaches,
         )
 
     def init_device(self):

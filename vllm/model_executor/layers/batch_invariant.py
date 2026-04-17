@@ -1012,6 +1012,7 @@ def override_envs_for_invariance(
         AttentionBackendEnum.FLASHINFER,
         AttentionBackendEnum.FLASH_ATTN_MLA,
         AttentionBackendEnum.TRITON_MLA,
+        AttentionBackendEnum.TRITON_ATTN,  # SAGE: for Gemma determinism
         # Not yet supported MLA backends
         # AttentionBackendEnum.FLASHMLA,
         # AttentionBackendEnum.FLEX_ATTENTION,  # IMA issue

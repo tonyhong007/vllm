@@ -1565,33 +1565,65 @@ class Scheduler(SchedulerInterface):
         """Check if a parent request has chunk blocks waiting to be freed."""
         return parent_id in self.sage_parent_chunk_blocks
 
-    def free_sage_chunk_blocks(self, parent_id: str) -> None:
+    def free_sage_chunk_blocks(
+        self, parent_id: str, chunk_req_id: str | None = None,
+    ) -> None:
         """Free chunk blocks when using CPU path (not zero-copy).
 
-        When using the CPU path for blending, chunk KV is retrieved from LMCache
-        (CPU/disk), so we don't need the GPU blocks anymore. This method frees
-        those blocks to prevent memory exhaustion.
+        When using the CPU path for blending, chunk KV is retrieved from
+        LMCache (CPU/disk) or has already been NCCL-shipped to home, so
+        we don't need the GPU blocks anymore.
+
+        If chunk_req_id is provided, free ONLY that chunk's blocks. This
+        is required on workers that hold multiple chunks of the same
+        parent: freeing all parent chunks at once would clobber sibling
+        chunks that haven't been sent yet (causing "No block IDs found"
+        the next time the worker tries to send another chunk for the
+        same parent).
+
+        If chunk_req_id is None, free all chunks for the parent (used by
+        the home GPU when it has decided to use the CPU path and won't
+        consume any more chunks).
         """
         if parent_id not in self.sage_parent_chunk_blocks:
             logger.debug(f"No chunk blocks to free for parent {parent_id}")
             return
 
-        chunk_block_info = self.sage_parent_chunk_blocks.pop(parent_id)
-        total_blocks_freed = 0
-
-        for chunk_id, block_ids, num_tokens, chunk_position in chunk_block_info:
-            # Free the blocks in the KV cache manager
-            self.kv_cache_manager.coordinator.free(chunk_id)
-            num_blocks = len(block_ids[0]) if block_ids and len(block_ids) > 0 else 0
-            total_blocks_freed += num_blocks
+        if chunk_req_id is None:
+            chunk_block_info = self.sage_parent_chunk_blocks.pop(parent_id)
+            total_blocks_freed = 0
+            for cid, block_ids, _ntokens, _pos in chunk_block_info:
+                self.kv_cache_manager.coordinator.free(cid)
+                num_blocks = (
+                    len(block_ids[0]) if block_ids and len(block_ids) > 0 else 0
+                )
+                total_blocks_freed += num_blocks
+                logger.info(
+                    f"[SAGE_FREE] Freed {num_blocks} blocks for chunk {cid} "
+                    f"(parent {parent_id})"
+                )
             logger.info(
-                f"[SAGE_FREE] Freed {num_blocks} blocks for chunk {chunk_id} "
-                f"(parent {parent_id})"
+                f"[SAGE_FREE] Total: freed {total_blocks_freed} blocks "
+                f"for parent {parent_id}"
             )
+            return
 
-        logger.info(
-            f"[SAGE_FREE] Total: freed {total_blocks_freed} blocks for parent {parent_id}"
-        )
+        # Single-chunk free: keep sibling entries intact.
+        entries = self.sage_parent_chunk_blocks[parent_id]
+        for i, (cid, block_ids, _ntokens, _pos) in enumerate(entries):
+            if cid == chunk_req_id:
+                self.kv_cache_manager.coordinator.free(cid)
+                num_blocks = (
+                    len(block_ids[0]) if block_ids and len(block_ids) > 0 else 0
+                )
+                logger.info(
+                    f"[SAGE_FREE] Freed {num_blocks} blocks for chunk {cid} "
+                    f"(parent {parent_id}, single-chunk)"
+                )
+                entries.pop(i)
+                break
+        if not entries:
+            del self.sage_parent_chunk_blocks[parent_id]
 
     def transfer_sage_blocks_to_parent_zero_copy(
         self, parent_id: str
@@ -1642,8 +1674,10 @@ class Scheduler(SchedulerInterface):
             total_tokens += num_tokens
             total_blocks += len(block_ids_raw[0]) if block_ids_raw else 0
             
-            # Clean up chunk tracking
+            # Clean up chunk tracking — now safe to remove from
+            # self.requests since blocks have been moved to parent.
             self.sage_chunk_to_parent.pop(chunk_id, None)
+            self.requests.pop(chunk_id, None)
         
         # Now assign all blocks to parent
         for manager_idx, manager in enumerate(coordinator.single_type_managers):
@@ -1969,6 +2003,15 @@ class Scheduler(SchedulerInterface):
             self.finished_recving_kv_req_ids.add(req_id)
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
+            # SAGE chunks: blocks are preserved for zero-copy transfer to
+            # parent. Don't free them here — they'll be freed when the
+            # parent request completes.
+            if req_id in self.sage_chunk_to_parent:
+                logger.debug(
+                    "[SAGE] Skipping _free_blocks for preserved chunk %s",
+                    req_id,
+                )
+                continue
             assert req_id in self.requests
             self._free_blocks(self.requests[req_id])
 

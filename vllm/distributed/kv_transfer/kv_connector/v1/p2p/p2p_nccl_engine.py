@@ -69,6 +69,9 @@ class SendQueueItem:
     tensor_id: str
     remote_address: str
     tensor: torch.Tensor
+    # Event recorded on the producer's stream at enqueue time, so the
+    # send_stream can wait on it before NCCL reads the tensor's memory.
+    ready_event: "torch.cuda.Event | None" = None
 
 
 class P2pNcclEngine:
@@ -243,11 +246,22 @@ class P2pNcclEngine:
         if remote_address is None:
             with self.recv_store_cv:
                 self.recv_store[tensor_id] = tensor
-                self.recv_store_cv.notify()
+                self.recv_store_cv.notify_all()
             return True
 
+        # Record an event on the producer's current stream so send_stream
+        # can wait for the tensor's memory writes (e.g. _extract_kv's
+        # contiguous() copy on the default stream) to complete before
+        # NCCL reads it. Without this, the worker's send_stream may
+        # consume stale K,V data, manifesting as non-deterministic recv
+        # hashes on the home GPU.
+        ready_event = torch.cuda.Event()
+        ready_event.record(torch.cuda.current_stream(self.device))
         item = SendQueueItem(
-            tensor_id=tensor_id, remote_address=remote_address, tensor=tensor
+            tensor_id=tensor_id,
+            remote_address=remote_address,
+            tensor=tensor,
+            ready_event=ready_event,
         )
 
         if self.send_type == "PUT":
@@ -443,7 +457,7 @@ class P2pNcclEngine:
                 with self.recv_store_cv:
                     self.recv_store[tensor_id] = tensor
                     self.have_received_tensor_id(tensor_id)
-                    self.recv_store_cv.notify()
+                    self.recv_store_cv.notify_all()
                 # Optional callback for SAGE parallel prefill.
                 if self._on_recv_callback is not None:
                     self._on_recv_callback(tensor_id)
@@ -545,6 +559,10 @@ class P2pNcclEngine:
             )
             return False
 
+        # Make send_stream wait for the producer's writes (recorded at
+        # enqueue time) before NCCL reads the tensor.
+        if item.ready_event is not None:
+            self.send_stream.wait_event(item.ready_event)
         self.send(comm, tensor.to(self.device), rank ^ 1, self.send_stream)
 
         if self.send_type == "PUT_ASYNC":

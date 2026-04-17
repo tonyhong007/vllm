@@ -186,6 +186,13 @@ class EngineCoreOutputs(
     utility_output: UtilityOutput | None = None
     finished_requests: set[str] | None = None
 
+    # SAGE parallel prefill: parents auto-registered inside EngineCore
+    # when the home GPU receives the first remote chunk for a request
+    # without local chunks. The frontend uses this to register the
+    # parent in the output_processor so wait_for_request can route
+    # the parent's decode tokens back to the caller.
+    concurrent_parents_added: list["EngineCoreRequest"] | None = None
+
     # In DP case, used to signal that the current wave of requests
     # has finished and the engines are paused.
     wave_complete: int | None = None

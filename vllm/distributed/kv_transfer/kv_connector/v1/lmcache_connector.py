@@ -104,6 +104,10 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
 
         self._kv_cache_events: LMCacheKVEvents | None = None
 
+        # SAGE per-layer send callback. When set, fires after each
+        # save_kv_layer call to send that layer's KV via NCCL.
+        self._sage_per_layer_send_callback = None
+
     # ==============================
     # Worker-side methods
     # ==============================
@@ -159,6 +163,9 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         self._lmcache_engine.save_kv_layer(
             layer_name, kv_layer, attn_metadata, **kwargs
         )
+        # SAGE per-layer: send this layer's KV to home via NCCL.
+        if self._sage_per_layer_send_callback is not None:
+            self._sage_per_layer_send_callback(layer_name)
 
     def wait_for_save(self):
         """

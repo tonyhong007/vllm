@@ -462,26 +462,48 @@ class LLM:
         request_id: str,
         timeout: float = 300,
     ) -> "RequestOutput":
-        """Block until a request produces finished output.
+        """Block until a single request produces finished output.
 
-        Used by SAGE parallel prefill: the home GPU submits local chunks
-        via generate(), then calls wait_for_request(parent_id) to block
-        until the parent request (created internally after all remote KV
-        arrives) finishes generating.
+        See `wait_for_requests` for the multi-request variant used by
+        concurrent SAGE parallel prefill workloads.
+        """
+        results = self.wait_for_requests({request_id}, timeout=timeout)
+        return results[request_id]
 
-        The engine loop keeps running (stepping, polling for remote KV,
-        assembling parent, blending, decoding) while this method blocks.
+    def wait_for_requests(
+        self,
+        request_ids: set[str],
+        timeout: float = 300,
+    ) -> dict[str, "RequestOutput"]:
+        """Block until ALL request_ids produce finished output.
+
+        Used by SAGE parallel prefill: the home GPU submits a batch of
+        parent requests' chunk metadata via generate(), then calls
+        wait_for_requests(parent_ids) to block until every parent
+        finishes generating. Outputs for any request id in the set are
+        captured as soon as they appear in step()'s output stream, so
+        no output is lost regardless of completion order.
+
+        Returns a dict mapping request_id → final RequestOutput.
         """
         import time as _time
+        pending = set(request_ids)
+        results: dict[str, "RequestOutput"] = {}
         deadline = _time.monotonic() + timeout
-        while _time.monotonic() < deadline:
+        while pending and _time.monotonic() < deadline:
             step_outputs = self.llm_engine.step()
             for output in step_outputs:
-                if output.request_id == request_id and output.finished:
-                    return output
-        raise TimeoutError(
-            f"wait_for_request({request_id!r}) timed out after {timeout}s"
-        )
+                if output.request_id in pending and output.finished:
+                    results[output.request_id] = output
+                    pending.discard(output.request_id)
+                    if not pending:
+                        break
+        if pending:
+            raise TimeoutError(
+                f"wait_for_requests timed out after {timeout}s, "
+                f"still pending: {sorted(pending)}"
+            )
+        return results
 
     def _get_modality_specific_lora_reqs(
         self,

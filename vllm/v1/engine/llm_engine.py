@@ -314,6 +314,17 @@ class LLMEngine:
         with record_function_or_nullcontext("llm_engine step: get_output"):
             outputs = self.engine_core.get_output()
 
+        # 1b) SAGE parallel prefill: register any parents that the
+        # EngineCore auto-registered (3+ GPU mode where the home GPU
+        # has no local chunks to submit via add_request).
+        if outputs.concurrent_parents_added:
+            for parent_req in outputs.concurrent_parents_added:
+                pid = parent_req.request_id
+                if pid in self.concurrent_parent_output_registered:
+                    continue
+                self.output_processor.add_request(parent_req, None, None, 0)
+                self.concurrent_parent_output_registered.add(pid)
+
         # 2) Process EngineCoreOutputs.
         with record_function_or_nullcontext("llm_engine step: process_outputs"):
             iteration_stats = IterationStats() if self.log_stats else None
