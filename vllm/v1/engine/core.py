@@ -534,7 +534,12 @@ class EngineCore:
             return
 
         if request.request_type == "concurrent":
-            assert self.enable_sage, "Concurrent request received but concurrent prefill is not enabled."
+            if not self.enable_sage:
+                raise ValueError(
+                    "Concurrent request received but concurrent prefill "
+                    "is not enabled. Set ENABLE_SAGE=True and configure "
+                    "LMCache to use SAGE concurrent prefill."
+                )
 
             if request.parent_request_id is None:
                 raise ValueError(
