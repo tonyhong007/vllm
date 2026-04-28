@@ -621,8 +621,7 @@ class Scheduler(SchedulerInterface):
                 )
 
                 if new_blocks is None:
-                    # The request cannot be scheduled.
-                    logger.info(
+                    logger.debug(
                         "[DEBUG_SCHED] Allocation FAILED for %s: "
                         "num_new_tokens=%d, num_external_computed_tokens=%d, "
                         "total_to_alloc=%d",

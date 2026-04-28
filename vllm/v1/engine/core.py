@@ -363,6 +363,14 @@ class EngineCore:
             "ENABLE_SAGE", "False"
         ).lower() == "true"
 
+        from collections import deque as _sage_deque
+        self._sage_pending_parents: "deque[tuple[str, object]]" = (
+            _sage_deque()
+        )
+        self._sage_pending_chunks: "deque[object]" = _sage_deque()
+        self._sage_stuck_steps = 0
+        self._sage_last_queue_size = -1
+
         # Remote chunks whose HEADER has been received (home GPU only).
         # parent_id -> {chunk_req_id: (position, dest_block_ids, num_tokens)}
         self._sage_remote_chunks_received: dict[str, dict[str, tuple]] = {}
@@ -746,18 +754,28 @@ class EngineCore:
                         e,
                     )
 
-            self.scheduler.add_request(request)
-            logger.info(
-                "[SAGE_CONCURRENT] Added chunk request %s "
-                "(chunk_id=%s, position=%s, total_chunks=%s) "
-                "for parent %s on rank=%d",
-                request.request_id,
-                request.chunk_id,
-                request.position,
-                request.total_chunks,
-                parent_id,
-                self._sage_instance_rank,
-            )
+            if self._sage_chunk_fits(request):
+                self.scheduler.add_request(request)
+                logger.info(
+                    "[SAGE_CONCURRENT] Added chunk request %s "
+                    "(chunk_id=%s, position=%s, total_chunks=%s) "
+                    "for parent %s on rank=%d",
+                    request.request_id,
+                    request.chunk_id,
+                    request.position,
+                    request.total_chunks,
+                    parent_id,
+                    self._sage_instance_rank,
+                )
+            else:
+                self._sage_pending_chunks.append(request)
+                logger.info(
+                    "[SAGE_BACKPRESSURE] Queued chunk %s "
+                    "(parent=%s, pos=%s); pending_chunks=%d "
+                    "(KV too tight to admit immediately)",
+                    request.request_id, parent_id, request.position,
+                    len(self._sage_pending_chunks),
+                )
             return
 
         raise ValueError(
@@ -806,6 +824,14 @@ class EngineCore:
         was executed.
         """
 
+        if self._sage_pending_chunks:
+            self._drain_sage_pending_chunks()
+        if self._sage_pending_parents:
+            self._drain_sage_pending_parents()
+            
+        if self.enable_sage:
+            self._sage_check_deadlock()
+
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
@@ -817,7 +843,18 @@ class EngineCore:
             ):
                 self._process_remote_chunk_arrivals()
                 self._drain_recompute_events()
-            return {}, False
+            if (
+                self._sage_pending_chunks
+                or self._sage_pending_parents
+            ):
+                self._drain_sage_pending_chunks()
+                self._drain_sage_pending_parents()
+                if self.scheduler.has_requests():
+                    pass
+                else:
+                    return {}, False
+            else:
+                return {}, False
         # Parallel prefill: drain any recompute events that arrived
         # between the previous step end and this step start, BEFORE
         # the scheduler runs the parent's forward. Otherwise the
@@ -2120,8 +2157,16 @@ class EngineCore:
             f"sage_blocks_transferred={parent_request.sage_blocks_transferred}"
         )
 
-        self.scheduler.add_request(parent_request)
         self._partial_cleanup_chunk_state(parent_id)
+        if self._sage_parent_fits(parent_request):
+            self.scheduler.add_request(parent_request)
+        else:
+            self._sage_pending_parents.append((parent_id, parent_request))
+            logger.info(
+                "[SAGE_BACKPRESSURE] Queued parent %s; pending=%d "
+                "(KV too tight to admit immediately)",
+                parent_id, len(self._sage_pending_parents),
+            )
 
         logger.info(
             "[SAGE_TIMING] launch_done t=%.6f elapsed=%.3fms",
@@ -2129,6 +2174,201 @@ class EngineCore:
             (_time.perf_counter() - _t_launch) * 1000,
         )
         logger.info(f"Final request {parent_id} first 100 token ids: {parent_request.prompt_token_ids[:100]}")
+
+    def _sage_check_deadlock(self) -> None:
+        """Detect SAGE chunk-pin deadlock and fail fast.
+
+        Symptom: KV is near-full, our SAGE pre-WAITING queues are
+        non-empty, and the queue size hasn't changed for many steps —
+        meaning chunks of one parent finished prefill and are pinned in
+        SAGE preserve, sibling chunks can't admit because KV is full,
+        and no one can release blocks (preserved chunks aren't
+        preemptible by vLLM). Without intervention this loops forever
+        in scheduler retries, eventually the API server times out, and
+        all clients see 500.
+
+        We fail fast instead — raise RuntimeError after sustained no
+        progress under pressure, so the cause is visible in logs and
+        the user gets an actionable message.
+        """
+        try:
+            block_pool = self.scheduler.kv_cache_manager.block_pool
+        except AttributeError:
+            return  # non-paged backend: no KV pool to check
+
+        free = block_pool.get_num_free_blocks()
+        total = block_pool.num_gpu_blocks
+        util = 1.0 - (free / total) if total > 0 else 0.0
+
+        queue_size = (
+            len(self._sage_pending_chunks)
+            + len(self._sage_pending_parents)
+        )
+
+        # No progress = queue size unchanged AND non-empty.
+        no_progress = (
+            queue_size > 0 and queue_size == self._sage_last_queue_size
+        )
+        self._sage_last_queue_size = queue_size
+
+        if util > 0.95 and no_progress:
+            self._sage_stuck_steps += 1
+        else:
+            self._sage_stuck_steps = 0
+
+        # ~200 consecutive stuck steps ≈ a few seconds of true stall.
+        # Tune up if false positives appear at heavy-but-progressing load.
+        if self._sage_stuck_steps > 200:
+            stalled_parents = [
+                pid
+                for pid, expected in self.concurrent_total_chunks.items()
+                if 0 < len(self.chunk_completion.get(pid, set())) < expected
+            ]
+            raise RuntimeError(
+                f"SAGE concurrent-prefill deadlock detected: "
+                f"KV at {util*100:.1f}% utilization, "
+                f"{queue_size} requests pending in SAGE pre-WAITING, "
+                f"{len(stalled_parents)} parent(s) partial-pin "
+                f"(chunks finished but cannot blend due to KV exhaustion). "
+                f"This happens when concurrent SAGE chunk admissions "
+                f"exceed the KV cache capacity. Reduce --concurrency, "
+                f"shorten prompts, or increase --gpu-memory-utilization."
+            )
+
+    def _sage_request_block_need(self, request, kvm) -> int:
+        """Non-destructive estimate of how many new blocks `request`
+        would need from `kvm.allocate_slots` right now.
+        """
+        prompt_len = len(request.prompt_token_ids)
+        num_tokens_need_slot = min(prompt_len, kvm.max_model_len)
+        return kvm.coordinator.get_num_blocks_to_allocate(
+            request_id=request.request_id,
+            num_tokens=num_tokens_need_slot,
+            new_computed_blocks=kvm.empty_kv_cache_blocks.blocks,
+            num_encoder_tokens=0,
+        )
+
+    def _sage_pending_waiting_demand(self, kvm) -> int:
+        """Sum the block demand of requests already in vLLM's WAITING
+        queue. They were admitted before us and will be allocated by
+        scheduler.schedule() ahead of any newly-admitted request, so
+        their demand must be subtracted from free blocks before we
+        decide whether the new request fits. This is what closes the
+        point-in-time hole — without it, every chunk in a 48-burst
+        sees `free_blocks` as if no other chunk had been admitted.
+        Cost: O(len(waiting)), small at our scale.
+        """
+        total = 0
+        for req in self.scheduler.waiting:
+            total += self._sage_request_block_need(req, kvm)
+        return total
+
+    def _sage_parent_fits(self, parent_request) -> bool:
+        """Whether `parent_request` can be admitted into the scheduler now.
+
+        Mirrors the two gates in vLLM's WAITING-admit loop
+        (scheduler.schedule()):
+
+          1. `len(running) >= max_num_running_reqs` — refuse.
+          2. `allocate_slots(...) is not None`, which boils down to
+             `num_blocks_to_allocate <= num_free_blocks`.
+
+        Gate (2) is replicated non-destructively by calling the same
+        `coordinator.get_num_blocks_to_allocate` that allocate_slots
+        uses internally. Because admit happens BEFORE any allocation,
+        we also subtract the demand of requests already in WAITING
+        (admitted before us this same step) so a burst of admits is
+        accounted cumulatively, not point-in-time.
+        """
+        sched = self.scheduler
+
+        if len(sched.running) >= sched.max_num_running_reqs:
+            return False
+
+        try:
+            kvm = sched.kv_cache_manager
+        except AttributeError:
+            return True
+
+        needed = self._sage_request_block_need(parent_request, kvm)
+        free = kvm.block_pool.get_num_free_blocks()
+        pending = self._sage_pending_waiting_demand(kvm)
+        return needed <= free - pending
+
+    def _sage_chunk_fits(self, chunk_request) -> bool:
+        """Whether `chunk_request` can be admitted into the scheduler now.
+
+        Same predicate as `_sage_parent_fits`. The only difference is
+        the magnitude: a fresh chunk has 0 existing blocks for its
+        request_id, so the coordinator returns the full prompt's
+        worth (~ceil(prompt_len / block_size)) — much more than the
+        ~0-1 a zero-copied parent needs.
+        """
+        sched = self.scheduler
+
+        if len(sched.running) >= sched.max_num_running_reqs:
+            return False
+
+        try:
+            kvm = sched.kv_cache_manager
+        except AttributeError:
+            return True
+
+        needed = self._sage_request_block_need(chunk_request, kvm)
+        free = kvm.block_pool.get_num_free_blocks()
+        pending = self._sage_pending_waiting_demand(kvm)
+        return needed <= free - pending
+
+    def _drain_sage_pending_chunks(self) -> None:
+        """Admit queued SAGE chunks while KV has room. FIFO by submit
+        time so chunks for one parent generally admit close together.
+        """
+        admitted = 0
+        while self._sage_pending_chunks:
+            request = self._sage_pending_chunks[0]
+            if not self._sage_chunk_fits(request):
+                break
+            self._sage_pending_chunks.popleft()
+            self.scheduler.add_request(request)
+            admitted += 1
+            logger.info(
+                "[SAGE_BACKPRESSURE] Admitted chunk %s from queue; "
+                "remaining_chunks=%d",
+                request.request_id, len(self._sage_pending_chunks),
+            )
+        if admitted == 0 and self._sage_pending_chunks:
+            logger.debug(
+                "[SAGE_BACKPRESSURE] %d chunk(s) waiting for KV room",
+                len(self._sage_pending_chunks),
+            )
+
+    def _drain_sage_pending_parents(self) -> None:
+        """Admit queued SAGE parents while KV has room.
+
+        Called at the top of step() — runs after the previous step's
+        finished requests have freed their blocks, so newly-available
+        space immediately admits backlogged parents in FIFO order.
+        """
+        admitted = 0
+        while self._sage_pending_parents:
+            parent_id, parent_request = self._sage_pending_parents[0]
+            if not self._sage_parent_fits(parent_request):
+                break
+            self._sage_pending_parents.popleft()
+            self.scheduler.add_request(parent_request)
+            admitted += 1
+            logger.info(
+                "[SAGE_BACKPRESSURE] Admitted parent %s from queue; "
+                "remaining=%d",
+                parent_id, len(self._sage_pending_parents),
+            )
+        if admitted == 0 and self._sage_pending_parents:
+            # Optional: surface tightness once per step (debug-level so
+            # we don't spam at INFO).
+            logger.debug(
+                "[SAGE_BACKPRESSURE] %d parent(s) waiting for KV room",
+                len(self._sage_pending_parents),
+            )
 
     def _partial_cleanup_chunk_state(self, parent_id: str) -> None:
         """Partial cleanup - preserves chunk blocks for blending."""
