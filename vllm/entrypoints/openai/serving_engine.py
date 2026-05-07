@@ -1278,6 +1278,18 @@ class OpenAIServing:
                 model_extra["query_token_count"]
             )
 
+            # Optional: total prompt tokens across all chunks of this parent.
+            # When supplied, the engine uses it to reserve the parent's full
+            # block budget on first-chunk admission and prevent sibling-chunk
+            # starvation under concurrent SAGE traffic.
+            if model_extra.get("parent_total_tokens") is not None:
+                try:
+                    metadata["parent_total_tokens"] = int(
+                        model_extra["parent_total_tokens"]
+                    )
+                except (TypeError, ValueError):
+                    pass
+
             # Optional: multi-GPU parallel prefill fields.
             if model_extra.get("home_kv_address") is not None:
                 metadata["home_kv_address"] = str(

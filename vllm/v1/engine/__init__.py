@@ -80,6 +80,11 @@ class EngineCoreRequest(
     chunk_id: int | None = None
     position: int | None = None
     total_chunks: int | None = None
+    # SAGE: total prompt tokens across all chunks of the parent, supplied by
+    # the client. Used by the engine-level chunk admission gate to reserve
+    # the parent's full block budget before admitting any chunk, preventing
+    # sibling-chunk starvation under concurrent SAGE traffic.
+    parent_total_tokens: int | None = None
     # SAGE: number of query/suffix tokens in the last chunk that should
     # always be recomputed during blending (excluded from diff_k selection).
     query_token_count: int | None = None

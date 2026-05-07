@@ -398,6 +398,7 @@ class InputProcessor:
         int | None,
         int | None,
         int | None,
+        int | None,
         str | None,
     ]:
         """Extract SAGE concurrent prefill metadata from the prompt dict.
@@ -411,6 +412,7 @@ class InputProcessor:
         chunk_id: int | None = None
         position: int | None = None
         total_chunks: int | None = None
+        parent_total_tokens: int | None = None
         query_token_count: int | None = None
         home_kv_address: str | None = None
 
@@ -421,6 +423,7 @@ class InputProcessor:
                 chunk_id,
                 position,
                 total_chunks,
+                parent_total_tokens,
                 query_token_count,
                 home_kv_address,
             )
@@ -455,6 +458,18 @@ class InputProcessor:
             if raw_total_chunks <= 0:
                 raise ValueError("total_chunks must be greater than 0.")
             total_chunks = raw_total_chunks
+
+        # Optional. When provided, the engine uses it to gate chunk admission
+        # at the parent level (see _sage_chunks_fit in core.py). Older clients
+        # that don't pass it fall back to per-chunk admission.
+        raw_parent_total_tokens = prompt.get("parent_total_tokens")
+        if raw_parent_total_tokens is not None:
+            try:
+                ptt = int(raw_parent_total_tokens)
+                if ptt > 0:
+                    parent_total_tokens = ptt
+            except (TypeError, ValueError):
+                parent_total_tokens = None
 
         if prompt.get("query_token_count") is not None:
             query_token_count = int(prompt["query_token_count"])
@@ -499,6 +514,7 @@ class InputProcessor:
             chunk_id,
             position,
             total_chunks,
+            parent_total_tokens,
             query_token_count,
             home_kv_address,
         )
@@ -536,6 +552,7 @@ class InputProcessor:
             chunk_id,
             position,
             total_chunks,
+            parent_total_tokens,
             query_token_count,
             home_kv_address,
         ) = self._extract_request_metadata(prompt)
@@ -657,6 +674,7 @@ class InputProcessor:
             chunk_id=chunk_id,
             position=position,
             total_chunks=total_chunks,
+            parent_total_tokens=parent_total_tokens,
             query_token_count=query_token_count,
             home_kv_address=home_kv_address,
         )

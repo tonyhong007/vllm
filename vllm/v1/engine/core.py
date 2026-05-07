@@ -419,6 +419,18 @@ class EngineCore:
         self.concurrent_parent_template: dict[str, Request] = {}
         self.concurrent_parent_sampling_params: dict[str, Any] = {}
         self.concurrent_total_chunks: dict[str, int] = {}
+        # parent_id -> total prompt tokens across all chunks (supplied by
+        # client). Used by the parent-aware chunk admission gate to reserve
+        # the parent's full block budget on first-chunk admission, so
+        # sibling chunks of the same parent can't be starved by other
+        # parents' chunks under concurrent SAGE traffic. Optional — a parent
+        # whose chunks don't carry this field falls back to per-chunk
+        # admission (legacy behavior).
+        self._sage_parent_total_tokens: dict[str, int] = {}
+        # parent_id -> blocks reserved at first-chunk admission. Cleared
+        # when the parent advances past chunk-admission (i.e., gets
+        # add_request'd to the scheduler in _partial_cleanup_chunk_state).
+        self._sage_parent_promised_blocks: dict[str, int] = {}
         self._concurrent_query_token_count: dict[str, int] = {}
         # parent_id -> {chunk_id: [MultiModalFeatureSpec, ...]}
         self._concurrent_chunk_mm_features: dict[str, dict[int, list]] = {}
@@ -616,6 +628,12 @@ class EngineCore:
             prev_total = self.concurrent_total_chunks.get(parent_id)
             if prev_total is None:
                 self.concurrent_total_chunks[parent_id] = request.total_chunks
+                # Capture parent_total_tokens on first-chunk arrival.
+                # Optional — when missing, parent-aware admission falls back
+                # to the per-chunk gate.
+                ptt = getattr(request, "parent_total_tokens", None)
+                if isinstance(ptt, int) and ptt > 0:
+                    self._sage_parent_total_tokens[parent_id] = ptt
             elif prev_total != request.total_chunks:
                 raise ValueError(
                     f"Inconsistent total_chunks for parent_request_id={parent_id}: "
@@ -768,13 +786,34 @@ class EngineCore:
                     self._sage_instance_rank,
                 )
             else:
-                self._sage_pending_chunks.append(request)
-                logger.info(
-                    "[SAGE_BACKPRESSURE] Queued chunk %s "
-                    "(parent=%s, pos=%s); pending_chunks=%d "
-                    "(KV too tight to admit immediately)",
-                    request.request_id, parent_id, request.position,
-                    len(self._sage_pending_chunks),
+                # DEBUG MODE: the controller is supposed to reserve KV bytes
+                # via BackendMemoryTracker before submitting, so this branch
+                # should be unreachable. Fail loud instead of silently
+                # queueing, so the controller bug is caught immediately.
+                # Original queueing logic preserved below for reference.
+                # self._sage_pending_chunks.append(request)
+                # logger.info(
+                #     "[SAGE_BACKPRESSURE] Queued chunk %s "
+                #     "(parent=%s, pos=%s); pending_chunks=%d "
+                #     "(KV too tight to admit immediately)",
+                #     request.request_id, parent_id, request.position,
+                #     len(self._sage_pending_chunks),
+                # )
+                kvm = self.scheduler.kv_cache_manager
+                free = kvm.block_pool.get_num_free_blocks()
+                pending = self._sage_pending_waiting_demand(kvm)
+                promised = sum(self._sage_parent_promised_blocks.values())
+                ptt = self._sage_parent_total_tokens.get(parent_id)
+                raise RuntimeError(
+                    f"[SAGE_DEBUG] Chunk admission rejected — controller "
+                    f"over-admitted. parent={parent_id} "
+                    f"chunk={request.request_id} pos={request.position}/"
+                    f"{request.total_chunks} parent_total_tokens={ptt} "
+                    f"free_blocks={free} waiting_demand={pending} "
+                    f"promised_other_parents={promised}. "
+                    "If controller-side reservation is correct this "
+                    "should never trigger; check BackendMemoryTracker "
+                    "and the qwen32b_8008 backend KV profile."
                 )
             return
 
@@ -2161,11 +2200,28 @@ class EngineCore:
         if self._sage_parent_fits(parent_request):
             self.scheduler.add_request(parent_request)
         else:
-            self._sage_pending_parents.append((parent_id, parent_request))
-            logger.info(
-                "[SAGE_BACKPRESSURE] Queued parent %s; pending=%d "
-                "(KV too tight to admit immediately)",
-                parent_id, len(self._sage_pending_parents),
+            # DEBUG MODE: parent admission should never fail when the
+            # controller has reserved correctly. Original queueing logic
+            # preserved below for reference.
+            # self._sage_pending_parents.append((parent_id, parent_request))
+            # logger.info(
+            #     "[SAGE_BACKPRESSURE] Queued parent %s; pending=%d "
+            #     "(KV too tight to admit immediately)",
+            #     parent_id, len(self._sage_pending_parents),
+            # )
+            kvm = self.scheduler.kv_cache_manager
+            free = kvm.block_pool.get_num_free_blocks()
+            needed = self._sage_request_block_need(parent_request, kvm)
+            running = len(self.scheduler.running)
+            max_running = self.scheduler.max_num_running_reqs
+            raise RuntimeError(
+                f"[SAGE_DEBUG] Parent admission rejected after chunks "
+                f"completed — controller over-admitted. parent={parent_id} "
+                f"needed_blocks={needed} free_blocks={free} "
+                f"running={running}/{max_running}. "
+                "If controller-side reservation is correct this should "
+                "never trigger; check BackendMemoryTracker and the "
+                "backend KV profile."
             )
 
         logger.info(
@@ -2298,11 +2354,14 @@ class EngineCore:
     def _sage_chunk_fits(self, chunk_request) -> bool:
         """Whether `chunk_request` can be admitted into the scheduler now.
 
-        Same predicate as `_sage_parent_fits`. The only difference is
-        the magnitude: a fresh chunk has 0 existing blocks for its
-        request_id, so the coordinator returns the full prompt's
-        worth (~ceil(prompt_len / block_size)) — much more than the
-        ~0-1 a zero-copied parent needs.
+        Two-tier check:
+          1. If we know the parent's full token count and this is the
+             first chunk of the parent, reserve the parent's *full* block
+             budget atomically. If we can't, defer the whole parent —
+             prevents the sibling-chunk-starvation deadlock.
+          2. Otherwise (subsequent chunk of an already-promised parent,
+             or parent_total_tokens unknown) fall back to the per-chunk
+             gate that the previous version used.
         """
         sched = self.scheduler
 
@@ -2314,9 +2373,40 @@ class EngineCore:
         except AttributeError:
             return True
 
-        needed = self._sage_request_block_need(chunk_request, kvm)
         free = kvm.block_pool.get_num_free_blocks()
         pending = self._sage_pending_waiting_demand(kvm)
+
+        parent_id = getattr(chunk_request, "parent_request_id", None)
+        if parent_id is not None and parent_id in self._sage_parent_promised_blocks:
+            # Sibling chunk of an already-admitted parent: it lands into
+            # the parent's reservation, so don't double-gate it. Always
+            # admit, scheduler will allocate from free blocks the parent
+            # already accounted for.
+            return True
+
+        if (
+            parent_id is not None
+            and parent_id in self._sage_parent_total_tokens
+        ):
+            # First chunk of a parent we have a total-tokens estimate for.
+            # Reserve the parent's full block budget (prompt tokens +
+            # 1 block of slack for the parent's final add_request tail).
+            block_size = self.vllm_config.cache_config.block_size
+            total_tokens = self._sage_parent_total_tokens[parent_id]
+            parent_needed = (
+                (total_tokens + block_size - 1) // block_size + 1
+            )
+            promised_by_others = sum(
+                n for pid, n in self._sage_parent_promised_blocks.items()
+                if pid != parent_id
+            )
+            if parent_needed <= free - pending - promised_by_others:
+                self._sage_parent_promised_blocks[parent_id] = parent_needed
+                return True
+            return False
+
+        # Per-chunk gate: parent_total_tokens unavailable.
+        needed = self._sage_request_block_need(chunk_request, kvm)
         return needed <= free - pending
 
     def _drain_sage_pending_chunks(self) -> None:
@@ -2384,6 +2474,11 @@ class EngineCore:
         self.concurrent_total_chunks.pop(parent_id, None)
         self._concurrent_query_token_count.pop(parent_id, None)
         self._concurrent_chunk_mm_features.pop(parent_id, None)
+        # Parent has finished chunk admission and is being added to the
+        # scheduler — release its block reservation so other parents can
+        # see the freed budget.
+        self._sage_parent_total_tokens.pop(parent_id, None)
+        self._sage_parent_promised_blocks.pop(parent_id, None)
         # SAGE parallel prefill state
         self._sage_remote_chunks_received.pop(parent_id, None)
         self._sage_remote_drains_done.pop(parent_id, None)
@@ -2422,6 +2517,10 @@ class EngineCore:
         self.concurrent_total_chunks.pop(parent_id, None)
         self._concurrent_query_token_count.pop(parent_id, None)
         self._concurrent_chunk_mm_features.pop(parent_id, None)
+        # Release the chunk-admission reservation if we still hold one
+        # (e.g., abort/error path before _partial_cleanup_chunk_state ran).
+        self._sage_parent_total_tokens.pop(parent_id, None)
+        self._sage_parent_promised_blocks.pop(parent_id, None)
         # SAGE parallel prefill state
         self._sage_remote_chunks_received.pop(parent_id, None)
         self._sage_remote_drains_done.pop(parent_id, None)

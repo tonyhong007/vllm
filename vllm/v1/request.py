@@ -50,6 +50,7 @@ class Request:
         chunk_id: int | None = None,
         position: int | None = None,
         total_chunks: int | None = None,
+        parent_total_tokens: int | None = None,
         query_token_count: int = 0,
         home_kv_address: str | None = None,
     ) -> None:
@@ -128,6 +129,7 @@ class Request:
         self.chunk_id = chunk_id
         self.position = position
         self.total_chunks = total_chunks
+        self.parent_total_tokens = parent_total_tokens
         self.home_kv_address = home_kv_address
         # State
         # The number of tokens with prefix cache hits.
@@ -193,6 +195,7 @@ class Request:
             chunk_id=request.chunk_id,
             position=request.position,
             total_chunks=request.total_chunks,
+            parent_total_tokens=request.parent_total_tokens,
             query_token_count=request.query_token_count or 0,
             home_kv_address=request.home_kv_address,
         )
