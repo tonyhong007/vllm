@@ -446,6 +446,55 @@ class LLMEngine:
     def apply_model(self, func: Callable[[nn.Module], _R]) -> list[_R]:
         return self.collective_rpc("apply_model", args=(func,))
 
+    def encode_video(
+        self,
+        pixel_values_videos: "torch.Tensor",
+        video_grid_thw: "torch.Tensor",
+    ) -> "torch.Tensor":
+        """Run the visual encoder on a video and return CPU embeddings.
+
+        Used by SAGE multimodal chunked prefill: encode the full video once
+        externally so the resulting embedding tensor can be sliced across
+        SAGE chunks. Inputs and outputs are CPU tensors.
+
+        Implementation: ships a closure to the worker via apply_model
+        (pickle path); the closure captures the input tensors so they
+        bypass msgspec's tensor-as-list coercion. Requires
+        VLLM_ALLOW_INSECURE_SERIALIZATION=1 to enable the pickle path.
+        """
+        import torch as _torch
+        # Ensure inputs are CPU tensors (so closure pickling is well-defined).
+        px_cpu = pixel_values_videos.detach().cpu()
+        gt_cpu = video_grid_thw.detach().cpu()
+
+        def _encode(model, _px=px_cpu, _gt=gt_cpu):
+            visual = getattr(model, "visual", None)
+            if visual is None:
+                raise RuntimeError(
+                    "Model has no `.visual`; encode_video unsupported."
+                )
+            # Stash outer wrapper on inner LM so SAGE blender's
+            # compute_layer can reach back to its embed_input_ids
+            # (which handles multimodal substitution + deepstack).
+            try:
+                inner_lm = model.get_language_model()
+                inner_lm._lmcache_outer_mm_model = model
+            except Exception:
+                pass
+            device = next(visual.parameters()).device
+            dtype = next(visual.parameters()).dtype
+            # grid_thw stays on CPU — the encoder calls .numpy() on it.
+            with _torch.no_grad():
+                out = visual(
+                    _px.to(device=device, dtype=dtype),
+                    grid_thw=_gt,  # CPU tensor
+                )
+            embeds = out[0] if isinstance(out, tuple) else out
+            return embeds.detach().cpu()
+
+        results = self.apply_model(_encode)
+        return results[0]
+
     def __del__(self):
         dp_group = getattr(self, "dp_group", None)
         if dp_group is not None and not self.external_launcher_dp:

@@ -639,6 +639,26 @@ class LLM:
         """
         return self.llm_engine.apply_model(func)
 
+    def encode_video(
+        self,
+        pixel_values_videos: "torch.Tensor",
+        video_grid_thw: "torch.Tensor",
+    ) -> "torch.Tensor":
+        """Run the visual encoder on one video, returning CPU embeddings.
+
+        Inputs are CPU tensors (typically obtained from `process_inputs`'s
+        `mm_features[0].data["pixel_values_videos"]` and `video_grid_thw`).
+        The encoder runs inside the worker (where the model lives); output
+        is moved to CPU before returning so it can serialize across the
+        RPC boundary.
+
+        Used by SAGE multimodal chunked prefill — encode the video once
+        externally, slice the embedding tensor across chunks, then submit
+        chunked requests with `type="video_embeds"` mm features so vLLM
+        skips re-encoding per chunk.
+        """
+        return self.llm_engine.encode_video(pixel_values_videos, video_grid_thw)
+
     def _get_beam_search_lora_requests(
         self,
         lora_request: list[LoRARequest] | LoRARequest | None,
